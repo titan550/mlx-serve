@@ -32,10 +32,12 @@ pub fn hcFusedEnabled() bool {
 pub const HcFusedOut = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };
 
 /// A deferred `hcWrite`: the next read's N kernel applies `stream + out*inj`
-/// itself (one dispatch fewer per block). Handles are retained copies.
+/// itself (one dispatch fewer per block). `out` and `inj` are retained copies; `ablate` (the forward's, borrowed)
+/// projects `out` first, in the launch or through `hc_decode2.ablateOut` where the launch does not take it.
 pub const HcPending = struct {
     out: mlx.mlx_array, // [B,S,hidden]
     inj: mlx.mlx_array, // [B,S,hc,1]
+    ablate: ?hc_decode2.Ablate = null,
     pub fn deinit(self: *HcPending) void {
         _ = mlx.mlx_array_free(self.out);
         _ = mlx.mlx_array_free(self.inj);
@@ -52,7 +54,8 @@ pub const HcPending = struct {
 /// `inj [B,S,hc,1]`, or null when the geometry/quant is outside the kernel
 /// (caller keeps the chain).
 pub const HC_FUSED_MAX_ROWS: c_int = 16;
-pub fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, bits: u32, gs: u32, pending: ?[]const HcPending) !?[]HcFusedOut {
+/// `group` is the slots' ablation joined (`width` rows per slot), when one rides their pending writes.
+pub fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, bits: u32, gs: u32, pending: ?[]const HcPending, group: ?hc_decode2.Ablate) !?[]HcFusedOut {
     if (!mlx.streamIsGpu(s) or !verifySharedHardware() or inputs.len < 2 or inputs.len > 8 or width < 2) return null;
     const total = @as(c_int, @intCast(inputs.len)) * width;
     if (total > HC_FUSED_MAX_ROWS or w.inject_flat.ctx == null) return null;
@@ -92,7 +95,7 @@ pub fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx
         }
         const out = try Join.array(s, outs[0..values.len]);
         errdefer _ = mlx.mlx_array_free(out);
-        joined_pending = .{ .out = out, .inj = try Join.array(s, injs[0..values.len]) };
+        joined_pending = .{ .out = out, .inj = try Join.array(s, injs[0..values.len]), .ablate = group };
     }
     const dense = w.down_rows.ctx != null;
     const full = (try hcReadFused(s, joined, 1, total, w.norm_w, if (dense) w.down_rows else w.down_w, w.down_s, w.down_b, if (dense) w.up_rows else w.up_w, w.up_s, w.up_b, w.inject_flat, eps, 4, 2560, bits, gs, joined_pending)) orelse return null;
@@ -190,9 +193,10 @@ pub fn hcReadFused(
         if (ish.len != 2 or ish[0] != K or ish[1] != hc) return null;
     }
 
-    const pending: ?hc_decode2.Pending = if (pend) |pd| .{ .out = pd.out, .inj = pd.inj } else null;
+    const pending: ?hc_decode2.Pending = if (pend) |pd| .{ .out = pd.out, .inj = pd.inj, .ablate = pd.ablate } else null;
+    // The CUDA twin has no ablation arm: the caller projects `out` and writes through the chain.
     const read = if (mlx.cudaAvailable())
-        try @import("../../sdk/blocks/hc/hc_cuda.zig").read(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), rows, hc, hidden, bits, group_size, pending)
+        (if (pend != null and pend.?.ablate != null) null else try @import("../../sdk/blocks/hc/hc_cuda.zig").read(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), rows, hc, hidden, bits, group_size, pending))
     else if (rows <= hc_decode2.maxRows())
         try hc_decode2.read(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), rows, hc, hidden, bits, group_size, pending)
     else
@@ -734,7 +738,7 @@ test "hc prefill: incompatible read writes immediately" {
             defer _ = mlx.mlx_array_free(h);
             var pending: ?HcPending = null;
             defer if (pending) |*p| p.deinit();
-            try xfm.hcWriteOrDefer(&h, out, inj, 1, 17, iw, &pending);
+            try xfm.hcWriteOrDefer(&h, out, inj, 1, 17, iw, &pending, null);
             const can_defer = dtype == .bfloat16 and inject_dtype == .bfloat16;
             try testing.expectEqual(can_defer, pending != null);
             try xfm.hcFlush(&h, 1, 17, &pending);
@@ -742,5 +746,106 @@ test "hc prefill: incompatible read writes immediately" {
             defer _ = mlx.mlx_array_free(expected);
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(h, expected, s));
         }
+    }
+}
+
+test "joined verify reads: an ablated group reads each slot as that slot's own ablated read, bit for bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !verifySharedHardware()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    hc_fused_override = true;
+    defer hc_fused_override = null;
+    const width: c_int = 3;
+    const strengths = [_]f32{ 1.0, 0.0, 0.5 };
+    var prng = std.Random.DefaultPrng.init(0xAB1AF0);
+    const rnd = prng.random();
+    const rand = struct {
+        fn bf16(r: std.Random, st: mlx.mlx_stream, shape: []const c_int, scale: f32, offset: f32) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try testing.allocator.alloc(f32, n);
+            defer testing.allocator.free(buf);
+            for (buf) |*v| v.* = (r.float(f32) - 0.5) * scale + offset;
+            const f = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, st));
+            return out;
+        }
+    };
+    var q: [2][3]mlx.mlx_array = undefined;
+    for ([_][2]c_int{ .{ 320, 10240 }, .{ 10240, 320 } }, 0..) |shape, i| {
+        const w = try rand.bf16(rnd, s, &shape, 0.2, 0);
+        defer _ = mlx.mlx_array_free(w);
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{}, s));
+        for (&q[i], 0..) |*o, k| {
+            o.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(o, triple, k));
+        }
+    }
+    defer for (q) |t| for (t) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    const w: HcWeights = .{
+        .norm_w = try rand.bf16(rnd, s, &.{ 4, 2560 }, 1.0, 1.0),
+        .down_w = q[0][0],
+        .down_s = q[0][1],
+        .down_b = q[0][2],
+        .up_w = q[1][0],
+        .up_s = q[1][1],
+        .up_b = q[1][2],
+        .inject_flat = try rand.bf16(rnd, s, &.{ 10240, 4 }, 0.1, 0),
+    };
+    defer {
+        _ = mlx.mlx_array_free(w.norm_w);
+        _ = mlx.mlx_array_free(w.inject_flat);
+    }
+    const dirs_host = try a.alloc(f32, strengths.len * 2560);
+    defer a.free(dirs_host);
+    for (dirs_host) |*v| v.* = (rnd.float(f32) - 0.5) * 0.04;
+    const group: hc_decode2.Ablate = .{
+        .dirs = mlx.mlx_array_new_data(dirs_host.ptr, &[_]c_int{ strengths.len, 2560 }, 2, .float32),
+        .strengths = mlx.mlx_array_new_data(&strengths, &[_]c_int{strengths.len}, 1, .float32),
+        .per = width,
+    };
+    defer {
+        _ = mlx.mlx_array_free(group.dirs);
+        _ = mlx.mlx_array_free(group.strengths);
+    }
+    var inputs: [strengths.len]mlx.mlx_array = undefined;
+    var pending: [strengths.len]HcPending = undefined;
+    var own: [strengths.len]hc_decode2.Ablate = undefined;
+    for (0..strengths.len) |i| {
+        inputs[i] = try rand.bf16(rnd, s, &.{ 1, width, 10240 }, 4.0, 0);
+        own[i] = .{
+            .dirs = mlx.mlx_array_new_data(dirs_host[i * 2560 ..].ptr, &[_]c_int{ 1, 2560 }, 2, .float32),
+            .strengths = mlx.mlx_array_new_data(&strengths[i], &[_]c_int{1}, 1, .float32),
+            .per = width,
+        };
+        pending[i] = .{ .out = try rand.bf16(rnd, s, &.{ 1, width, 2560 }, 2.0, 0), .inj = try rand.bf16(rnd, s, &.{ 1, width, 4, 1 }, 1.0, 1.0), .ablate = own[i] };
+    }
+    defer for (0..strengths.len) |i| {
+        _ = mlx.mlx_array_free(inputs[i]);
+        pending[i].deinit();
+        _ = mlx.mlx_array_free(own[i].dirs);
+        _ = mlx.mlx_array_free(own[i].strengths);
+    };
+    const before = hc_decode2.ablate_served;
+    const joined = (try hcReadJoined(a, s, &inputs, w, width, 1e-6, 8, 64, &pending, group)) orelse return error.HcFusedDeclined;
+    defer {
+        for (joined) |r| inline for (.{ "mixed", "inj", "stream" }) |name| {
+            _ = mlx.mlx_array_free(@field(r, name));
+        };
+        a.free(joined);
+    }
+    try testing.expectEqual(before + 1, hc_decode2.ablate_served);
+    for (0..strengths.len) |i| {
+        const solo = (try hcReadFused(s, inputs[i], 1, width, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, 1e-6, 4, 2560, 8, 64, pending[i])) orelse return error.HcFusedDeclined;
+        defer inline for (.{ "mixed", "inj", "stream" }) |name| {
+            _ = mlx.mlx_array_free(@field(solo, name));
+        };
+        inline for (.{ "mixed", "inj", "stream" }) |name| try testing.expect(try bf16BitEqual(@field(joined[i], name), @field(solo, name), s));
     }
 }

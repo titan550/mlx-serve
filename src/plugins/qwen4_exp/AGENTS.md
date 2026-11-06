@@ -23,6 +23,9 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   snapshot / bytes / serialize for the prefix cache and SSD; (6) group lanes and the grouped verify on the plugin arm;
   (7) the rerank on the head's mixer output; (8) the slot's whole M-RoPE table (`intree.enter` hands the engine's ctx,
   `plugin.engineCtx`, a `SharedThreadLocal`).
+- Ablation (`Caps.ablation`, `ablate.zig`): every residual write (embedding, PLE add, attention/GDN/QSA, MoE) is
+  projected before the streams, folded into the two-launch read (`hc_decode2.Ablate`) else `ablateOut`; the MTP head
+  drafts unablated; a Thunderbolt pair refuses. Guard: the served test's per-path cosine bound.
 - Unserved hooks: `cache.aux` (QSA history + PLE prev in checkpoints/SSD ride the engine's SSM entries),
   `capture_stream_all` (no caller on this arch).
 - QSA's generic half is the SDK's block-sparse attention (`sdk/blocks/attention/sparse_block/`: `Blocks`/`Params`,
