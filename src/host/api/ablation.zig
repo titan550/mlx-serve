@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("../../sdk/util/log.zig");
 const Request = @import("../../sdk/request/ablation.zig").Request;
+const Prefix = @import("../../sdk/request/ablation.zig").Prefix;
 const Conn = @import("../http/conn.zig").Conn;
 const http_server = @import("../http/server.zig");
 const LoadedModel = @import("../registry/registry.zig").LoadedModel;
@@ -284,13 +285,25 @@ pub const Outcome = union(enum) {
 pub const Selected = struct {
     profile: *const Profile,
     strength: f32,
+    prefix: Prefix = default_prefix,
 
     pub fn request(self: Selected) Request {
         var h = std.hash.Wyhash.init(self.profile.hash);
         h.update(std.mem.asBytes(&self.strength));
-        return .{ .direction = self.profile.direction, .strength = self.strength, .key = h.final() | 1 };
+        return .{ .direction = self.profile.direction, .strength = self.strength, .key = h.final() | 1, .prefix = self.prefix };
     }
 };
+
+/// The prefix-cache sharing of a request that names none (`Prefix`).
+pub const default_prefix: Prefix = .isolated;
+
+/// A request's own `prefix_cache`: `isolated` or `read`. `shared` changes what every later request restores, so only
+/// the server sets it.
+fn requestPrefix(v: std.json.Value) ?Prefix {
+    if (v != .string) return null;
+    const p = std.meta.stringToEnum(Prefix, v.string) orelse return null;
+    return if (p == .shared) null else p;
+}
 
 fn bad(msg: []const u8) Outcome {
     return .{ .refused = .{ .status = "400 Bad Request", .code = 400, .msg = msg } };
@@ -306,12 +319,16 @@ pub fn resolve(set: ?*const Set, v: std.json.Value, presented_key: ?[]const u8, 
     const s = set orelse return bad("ablation is not enabled on this server");
     const key = presented_key orelse return unauthorized("ablation key missing (X-Ablation-Key header)");
     if (!s.keyMatches(key)) return unauthorized("ablation key rejected");
-    if (v != .object) return bad("ablation must be an object {\"profile\": string, \"strength\": number}");
+    if (v != .object) return bad("ablation must be an object {\"profile\": string, \"strength\": number, \"prefix_cache\": string}");
     var it = v.object.iterator();
     while (it.next()) |kv| {
-        if (!std.mem.eql(u8, kv.key_ptr.*, "profile") and !std.mem.eql(u8, kv.key_ptr.*, "strength"))
-            return bad(std.fmt.bufPrint(msg_buf, "unknown field 'ablation.{s}'", .{clip(kv.key_ptr.*)}) catch "unknown field in ablation");
+        const known = for ([_][]const u8{ "profile", "strength", "prefix_cache" }) |k| {
+            if (std.mem.eql(u8, kv.key_ptr.*, k)) break true;
+        } else false;
+        if (!known) return bad(std.fmt.bufPrint(msg_buf, "unknown field 'ablation.{s}'", .{clip(kv.key_ptr.*)}) catch "unknown field in ablation");
     }
+    const prefix = if (v.object.get("prefix_cache")) |pv| requestPrefix(pv) orelse
+        return bad("ablation.prefix_cache must be \"isolated\" or \"read\" (\"shared\" is the server's setting)") else default_prefix;
     const name_v = v.object.get("profile") orelse return bad("ablation.profile is required");
     if (name_v != .string) return bad("ablation.profile must be a string");
     const strength: f32 = if (v.object.get("strength")) |sv| switch (sv) {
@@ -327,7 +344,7 @@ pub fn resolve(set: ?*const Set, v: std.json.Value, presented_key: ?[]const u8, 
     if (p.direction.len != served.hidden) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (hidden size {d}, the model's is {d})", .{ p.name, p.direction.len, served.hidden }) catch "ablation profile is for another model");
     const sha = served.config_sha256 orelse return bad("ablation: the model's config.json could not be read to check the profile");
     if (!std.mem.eql(u8, &sha, &p.config_sha256)) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (config.json digest differs)", .{p.name}) catch "ablation profile is for another model");
-    return .{ .selected = .{ .profile = p, .strength = strength } };
+    return .{ .selected = .{ .profile = p, .strength = strength, .prefix = prefix } };
 }
 
 fn clip(s: []const u8) []const u8 {
@@ -510,6 +527,9 @@ test "ablation request: every refusal row of the failure matrix, and the key nev
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = .{ .hidden = 4, .serves = false, .config_sha256 = sha }, .code = 400, .says = "does not serve" },
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = .{ .hidden = 8, .serves = true, .config_sha256 = sha }, .code = 400, .says = "hidden size" },
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = other, .code = 400, .says = "digest differs" },
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"shared\"}", .key = test_key, .served = served, .code = 400, .says = "the server's setting" },
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"warm\"}", .key = test_key, .served = served, .code = 400, .says = "prefix_cache must be" },
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":1}", .key = test_key, .served = served, .code = 400, .says = "prefix_cache must be" },
     };
     for (cases) |c| {
         const o = resolve(c.set, try json(a, c.field), c.key, c.served, &buf);
@@ -527,7 +547,11 @@ test "ablation request: every refusal row of the failure matrix, and the key nev
     const zero = resolve(&set, try json(a, "{\"profile\":\"good\",\"strength\":0}"), test_key, served, &buf);
     try testing.expect(zero == .selected and zero.selected.strength == 0);
     const dflt = resolve(&set, try json(a, "{\"profile\":\"good\"}"), test_key, served, &buf);
-    try testing.expect(dflt == .selected and dflt.selected.strength == 1.0);
+    try testing.expect(dflt == .selected and dflt.selected.strength == 1.0 and dflt.selected.request().prefix == default_prefix);
+    inline for (.{ .{ "read", Prefix.read }, .{ "isolated", Prefix.isolated } }) |c| {
+        const named = resolve(&set, try json(a, "{\"profile\":\"good\",\"prefix_cache\":\"" ++ c[0] ++ "\"}"), test_key, served, &buf);
+        try testing.expect(named == .selected and named.selected.request().prefix == c[1]);
+    }
 }
 
 test "ablation request: the key folds the strength in, never 0" {

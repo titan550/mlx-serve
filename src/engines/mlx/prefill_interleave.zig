@@ -324,7 +324,7 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget)
 /// that skips the cache, or carries media (media rows are never matched by token), counts whole.
 pub fn slotUncachedTail(slot: *Slot) usize {
     const total = slot.full_prompt.len;
-    if (slot.skip_prefix_cache or slot.cache_variant != 0 or slot.media.len > 0) return total;
+    if (slot.skip_prefix_cache or (slot.cache_variant != 0 and !slot.reads_base_prefix) or slot.media.len > 0) return total;
     const hc = if (slot.model.prefix_cache) |p| p else return total;
     return total - @min(total, hc.peekMatchedTokens(slot.full_prompt, slot.has_tools, slot.cache.config, slot.ssm_entries != null));
 }

@@ -30,6 +30,12 @@ strength or field, a model whose plugin lacks `Caps.ablation`, or the field sent
 the Ollama routes or a proxied `<id>@<provider>` / `<id>@<peer>` model. Other endpoints ignore it. The key is
 compared with surrounding whitespace trimmed; browsers may send `X-Ablation-Key` and read `X-Ablation` cross-origin.
 
+`"prefix_cache"` in the same object sets how the request shares the prompt cache with unablated requests. `"isolated"`
+(the default) restores and commits nothing beside them. `"read"` restores the conversation's unablated KV cache, so an
+ablated turn in the middle of a long session does not re-read it, and commits nothing. `"shared"` is refused: it
+would commit KV computed under the ablation that other requests then restore. A model that keeps its own state
+(DeepSeek-V4.1) keys its cache by the ablation either way.
+
 A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"version": 1`, `hidden_size`,
 `base_config_sha256`: sha256 of the base pack's exact `config.json` bytes) and `direction.safetensors` (one tensor
 `direction`, `[hidden]`, F32/F16/BF16, normalized at load). Make the key with
