@@ -74,6 +74,8 @@ class ServerManager: ObservableObject {
     @Published var batching: BatchingInfo?
     /// The Thunderbolt cluster this server hosts, from `/props`; nil when it hosts none.
     @Published var cluster: ClusterInfo?
+    /// `/props` `ablation` for the resident chat model, filed under the id it was asked for.
+    @Published var ablationStatus: AblationStatus?
     @Published var port: UInt16 = 11234
     @Published var currentModelPath: String = ""
     @Published var lastError: String = ""
@@ -219,6 +221,13 @@ class ServerManager: ObservableObject {
             status = .error(lastError)
             return
         }
+        // The server exits at start without the folder and key its launch flags name.
+        do { try AblationFiles.ensure() }
+        catch {
+            lastError = "Could not prepare the ablation folder and key: \(error.localizedDescription)"
+            status = .error(lastError)
+            return
+        }
         port = options.port
         api.host = options.host
         status = .starting
@@ -339,6 +348,7 @@ class ServerManager: ObservableObject {
         memoryInfo = nil
         specCost = nil
         batching = nil
+        ablationStatus = nil
     }
 
     /// Distill a crashed server's stderr tail into one human-meaningful line for
@@ -640,13 +650,16 @@ class ServerManager: ObservableObject {
     }
 
     private func refreshStatus() async {
-        if let props = try? await api.fetchProps(port: port) {
+        // Read before the await: a model switch mid-flight must not file one model's answer under another.
+        let chatModel = residentChatModel?.name
+        if let props = try? await api.fetchProps(port: port, model: chatModel) {
             var memory = props.memory
             memory.gpuLimitBytes = SystemMetrics.gpuMemoryLimitBytes()
             memoryInfo = memory
             specCost = props.specCost
             batching = props.batching
             cluster = props.cluster
+            ablationStatus = props.ablation
             await noteRegistryGeneration(props.registryGeneration)
         }
         // `/v1/models` reads every model's config, so it is re-read only when

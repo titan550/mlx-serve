@@ -43,6 +43,17 @@ final class ServerManagerStopTests: XCTestCase {
                      "a stopped server has nothing resident to answer chat, so the pill must not fall back to the old model")
     }
 
+    /// A stopped server's complaint about a model's ablation setting must not greet the next one.
+    func testStopClearsTheAblationStatus() {
+        let server = ServerManager()
+        server.status = .running
+        server.ablationStatus = AblationStatus(modelId: "old-model", setting: nil, error: "cannot run")
+
+        server.stop()
+
+        XCTAssertNil(server.ablationStatus)
+    }
+
     /// A stop during a start ends the wait for `.running` instead of running out the timeout.
     func testStopDuringStartEndsTheWaitForRunning() async {
         let server = ServerManager()

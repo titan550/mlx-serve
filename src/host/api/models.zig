@@ -3,6 +3,7 @@
 
 const speech_api = @import("speech.zig");
 const std = @import("std");
+const ablation = @import("ablation.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const chat_mod = @import("../chat/chat.zig");
@@ -264,8 +265,10 @@ pub fn renderModelEntry(
             try allocator.dupe(u8, "null");
         defer allocator.free(embed_limit_str);
 
+        const ablation_part = try ablation.rowJson(allocator, io, entry);
+        defer allocator.free(ablation_part);
         return std.fmt.allocPrint(allocator,
-            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s}{s}{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s}{s}{s}{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id_json,
             nowSecs(io),
@@ -282,6 +285,7 @@ pub fn renderModelEntry(
             mods,
             speech_part,
             facts,
+            ablation_part,
             arch_label,
             modelEngineName(if (entry.engine) |e| e.kind else null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.config, entry.path, entry.arch_hint),
             config.vocab_size,
@@ -456,9 +460,11 @@ pub fn renderModelEntry(
 
     const id_json = try jsonEscape(allocator, entry.id);
     defer allocator.free(id_json);
+    const ablation_part = try ablation.rowJson(allocator, io, entry);
+    defer allocator.free(ablation_part);
     return std.fmt.allocPrint(allocator,
-        \\{{"id":{s},"object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ id_json, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, stub_speech, facts, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":{s},"object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ id_json, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, stub_speech, facts, ablation_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 pub fn handleModels(

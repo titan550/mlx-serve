@@ -191,6 +191,99 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertTrue(ModelOverride(ctxSize: 8192).changesLoad(from: before))
     }
 
+    /// `ablation` round-trips by the server's keys, an entry holding only it
+    /// is kept, and the server reads it per request, so it never reloads.
+    func testAblationRoundTripsAndNeedsNoReload() throws {
+        let path = tempPath()
+        var file = ModelSettingsFile()
+        var o = ModelOverride()
+        o.ablation = AblationSetting(profile: "refusal", strength: 0.5, prefixCache: "shared")
+        XCTAssertFalse(o.isEmpty)
+        file.set(o, for: "/m/a")
+        try file.save(path: path)
+
+        let root = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path))) as? [String: Any]
+        let stored = (root?["/m/a"] as? [String: Any])?["ablation"] as? [String: Any]
+        XCTAssertEqual(stored?["profile"] as? String, "refusal")
+        XCTAssertEqual(stored?["strength"] as? Double, 0.5)
+        XCTAssertEqual(stored?["prefix_cache"] as? String, "shared")
+        XCTAssertEqual(ModelSettingsFile.load(path: path).override(for: "/m/a")?.ablation, o.ablation)
+
+        var off = o
+        off.ablation?.strength = 0
+        XCTAssertNotEqual(off, o)
+        XCTAssertFalse(off.changesLoad(from: o))
+        XCTAssertFalse(ModelOverride().changesLoad(from: o))
+        XCTAssertFalse(o.changesLoad(from: ModelOverride()))
+        XCTAssertEqual(ModelOverride(json: ["ablation": ["profile": "p"]]).ablation,
+                       AblationSetting(profile: "p", strength: 1, prefixCache: nil), "strength defaults to 1")
+    }
+
+    /// An `ablation` the app cannot write back whole stays verbatim, like an
+    /// unknown key: a save keeps it and the server names what is wrong.
+    func testAnUnreadableAblationIsKeptVerbatim() throws {
+        let bad: [Any] = ["p", ["profile": 7], ["strength": 1], ["profile": ""], ["profile": "p", "strength": 1.5],
+                          ["profile": "p", "strength": true], ["profile": "p", "prefix_cache": 1],
+                          ["profile": "p", "prefix_cache": "warm"], ["profile": "p", "layers": [1]]]
+        for value in bad {
+            let o = ModelOverride(json: ["ablation": value])
+            XCTAssertNil(o.ablation, "\(value)")
+            XCTAssertNotNil(o.extra["ablation"], "\(value)")
+        }
+
+        let path = tempPath()
+        try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
+                                                withIntermediateDirectories: true)
+        try #"{"/m/a": {"ctx_size": 4096, "ablation": {"profile": "p", "strength": 2}}}"#
+            .write(toFile: path, atomically: true, encoding: .utf8)
+        var file = ModelSettingsFile.load(path: path)
+        var o = try XCTUnwrap(file.override(for: "/m/a"))
+        o.ctxSize = 8192
+        file.set(o, for: "/m/a")
+        try file.save(path: path)
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"strength\" : 2"), text)
+        XCTAssertTrue(text.contains("\"ctx_size\" : 8192"), text)
+    }
+
+    /// The menu bar writes only `ablation`: every other key stays as the file
+    /// has it, and nil removes it (an unreadable one too) with an entry it leaves empty.
+    func testSetAblationReplacesOnlyThatKey() throws {
+        let path = tempPath()
+        try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
+                                                withIntermediateDirectories: true)
+        try #"{"/m/a": {"ctx_size": 8192, "future": 1, "ablation": {"profile": "p", "strength": 2}}}"#
+            .write(toFile: path, atomically: true, encoding: .utf8)
+        var file = ModelSettingsFile.load(path: path)
+        let set = AblationSetting(profile: "q", strength: 0.25, prefixCache: "isolated")
+        file.setAblation(set, for: "/m/a/")
+        try file.save(path: path)
+        var back = ModelSettingsFile.load(path: path)
+        XCTAssertEqual(back.override(for: "/m/a")?.ablation, set)
+        XCTAssertEqual(back.override(for: "/m/a")?.ctxSize, 8192)
+        XCTAssertEqual(back.override(for: "/m/a")?.extra["future"] as? Int, 1)
+
+        back.setAblation(nil, for: "/m/a")
+        back.setAblation(AblationSetting(profile: "p"), for: "/m/b")
+        try back.save(path: path)
+        var text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertFalse(text.contains("\"q\""), text)
+        XCTAssertTrue(text.contains("\"ctx_size\" : 8192"), text)
+        XCTAssertTrue(text.contains("\"/m/b\""), "an entry holding only ablation is kept: \(text)")
+
+        var again = ModelSettingsFile.load(path: path)
+        again.setAblation(nil, for: "/m/b")
+        try again.save(path: path)
+        text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertFalse(text.contains("/m/b"), text)
+
+        try #"{"/m/c": {"ablation": "p"}}"#.write(toFile: path, atomically: true, encoding: .utf8)
+        var unreadable = ModelSettingsFile.load(path: path)
+        unreadable.setAblation(nil, for: "/m/c")
+        try unreadable.save(path: path)
+        XCTAssertTrue(ModelSettingsFile.load(path: path).isEmpty)
+    }
+
     /// The overflow card's button goes to the per-model sheet only when that
     /// model already has overrides; otherwise Settings, as before.
     func testContextIncreaseTarget() {

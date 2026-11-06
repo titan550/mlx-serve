@@ -547,6 +547,8 @@ struct ModelInfo {
     /// `engines`: what can serve this pack ("mlx", "ane", "ds4", "llama") — the
     /// Model Settings engine picker's choices. Empty on older servers.
     var engines: [String] = []
+    /// `ablation_profiles`: the ablation profiles that fit this pack, loaded when the server started.
+    var ablationProfiles: [String] = []
 
     /// Whether this LAN-mirrored entry serves `capability` — the tray
     /// empty-state and the "On Your Network" pickers count through this, not

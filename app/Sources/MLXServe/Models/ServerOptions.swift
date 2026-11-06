@@ -833,6 +833,9 @@ struct ServerOptions: Codable, Equatable {
         if mlxGguf {
             args += ["--mlx-gguf"]
         }
+        // ALWAYS: a model's `ablation` setting is read per request, so the profiles
+        // must be loaded from the start (`AblationFiles.ensure` makes both paths).
+        args += ["--ablation-profiles", AblationFiles.profilesPath, "--ablation-key-file", AblationFiles.keyPath]
         return args
     }
 

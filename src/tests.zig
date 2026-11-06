@@ -128,6 +128,7 @@ test {
     _ = @import("host/api/schema_check.zig");
     _ = @import("sdk/util/err_name.zig");
     _ = @import("sdk/request/request.zig");
+    _ = @import("sdk/request/ablation.zig");
     _ = @import("sdk/spec/dflash_contract.zig");
     _ = @import("host/engines/prompt.zig");
     _ = @import("engines/mlx/runtime/engine_load.zig");

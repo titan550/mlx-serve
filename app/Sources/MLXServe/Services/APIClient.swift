@@ -242,7 +242,8 @@ class APIClient {
             provider: first["provider"] as? String,
             agentBudget: AgentBudget.parse(first["agent_budget"]),
             modality: first["modality"] as? String,
-            engines: first["engines"] as? [String] ?? []
+            engines: first["engines"] as? [String] ?? [],
+            ablationProfiles: first["ablation_profiles"] as? [String] ?? []
         )
     }
 
@@ -438,16 +439,29 @@ class APIClient {
         let cluster: ClusterInfo?
         /// Moves whenever `/v1/models` would read differently; nil from older servers.
         let registryGeneration: UInt64?
+        /// Filed under the model the request named; nil for the bare route.
+        var ablation: AblationStatus? = nil
     }
 
-    func fetchProps(port: UInt16) async throws -> PropsSnapshot? {
-        let url = serverURL(port: port, path: "/props")
-        let (data, _) = try await session.data(from: url)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let mem = json["memory"] as? [String: Any] else { return nil }
+    /// `model` names the model the per-model parts describe; nil = the server's default.
+    func fetchProps(port: UInt16, model: String? = nil) async throws -> PropsSnapshot? {
+        let (data, _) = try await session.data(from: propsURL(port: port, model: model))
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return Self.propsSnapshot(json, model: model)
+    }
+
+    static func propsSnapshot(_ json: [String: Any], model: String?) -> PropsSnapshot? {
+        guard let mem = json["memory"] as? [String: Any] else { return nil }
         return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json),
                              cluster: ClusterInfo.parse(json),
-                             registryGeneration: (json["registry_generation"] as? NSNumber)?.uint64Value)
+                             registryGeneration: (json["registry_generation"] as? NSNumber)?.uint64Value,
+                             ablation: model.flatMap { AblationStatus.parse(json, modelId: $0) })
+    }
+
+    private func propsURL(port: UInt16, model: String?) -> URL {
+        var components = URLComponents(url: serverURL(port: port, path: "/props"), resolvingAgainstBaseURL: false)
+        components?.queryItems = model.map { [URLQueryItem(name: "model", value: $0)] }
+        return components?.url ?? serverURL(port: port, path: "/props")
     }
 
     /// The whole `/props` document. Settings are per MODEL and the bare
@@ -457,10 +471,7 @@ class APIClient {
     /// default. Parsing lives in `BenchmarkSettings.flatten`; this hands
     /// back raw JSON.
     func fetchPropsRaw(port: UInt16, model: String? = nil) async throws -> [String: Any] {
-        var components = URLComponents(url: serverURL(port: port, path: "/props"), resolvingAgainstBaseURL: false)
-        components?.queryItems = model.map { [URLQueryItem(name: "model", value: $0)] }
-        let url = components?.url ?? serverURL(port: port, path: "/props")
-        let (data, _) = try await session.data(from: url)
+        let (data, _) = try await session.data(from: propsURL(port: port, model: model))
         return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
