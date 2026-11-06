@@ -62,6 +62,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_responses_api.sh`, `test_responses_streaming.sh` /v1/responses · `test_output_config.sh` Anthropic `output_config`
 - `test_ollama_api.sh` /api/* · `test_continuation.sh` continue a partial reply · `test_timings.sh` `timings` block
 - `test_models_capabilities.sh` /v1/models capabilities · `test_metrics.sh`, `test_metrics_outcomes.sh` --metrics
+- `test_ablation_model_setting.sh` **E** the `ablation` model setting: every surface, no key, strength 0 = stock bytes, a 503 `/props` explains
 - `test_index_page.sh` **H** console at GET / · `test_route_404_no_load.sh` unknown path loads nothing
 - `test_headless_spec_flags.sh` **H** headless honours spec flags, 404 before resolution
 - `test_providers.sh` **H** upstream providers via stubs · `test_launch_cmd.sh` `mlx-serve launch <agent>`

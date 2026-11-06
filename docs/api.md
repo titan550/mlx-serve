@@ -36,6 +36,14 @@ ablated turn in the middle of a long session does not re-read it, and commits no
 would commit KV computed under the ablation that other requests then restore. A model that keeps its own state
 (DeepSeek-V4.1) keys its cache by the ablation either way.
 
+A model's entry in `~/.mlx-serve/model-settings.json` may carry the same object, `"ablation": {"profile", "strength",
+"prefix_cache"}`, read per request: every request to that model that names no `ablation` runs under it, on every
+text surface (`/v1/messages`, `/v1/responses` and the Ollama routes included), with no key (the server's own file),
+and its `prefix_cache` may be `"shared"`. Strength 0 keeps the profile but runs standard. A setting the server cannot
+run (no `--ablation-profiles`, an unknown or mismatched profile, a model without `Caps.ablation`) fails each request
+on that model with a 503 naming why. `/props?model=<id>` reports `"ablation": {"setting", "error"}`, and each
+`/v1/models` row lists the profiles made from its pack in `ablation_profiles`.
+
 A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"version": 1`, `hidden_size`,
 `base_config_sha256`: sha256 of the base pack's exact `config.json` bytes) and `direction.safetensors` (one tensor
 `direction`, `[hidden]`, F32/F16/BF16, normalized at load). Make the key with

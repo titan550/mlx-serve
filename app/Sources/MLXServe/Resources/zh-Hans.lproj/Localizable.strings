@@ -2486,3 +2486,11 @@
 "Rebuild" = "重新构建";
 "Not in the catalog: rebuild it from its source with this release's kit" = "不在目录中：请用此版本的工具包从源码重新构建";
 "Needs rebuild" = "需要重新构建";
+/* Ablation: Model Settings and the menu bar */
+"Ablation" = "消融";
+"Profile" = "配置";
+"Strength" = "强度";
+"Reuse prefix cache" = "复用前缀缓存";
+"Applies to every request to this model, from any app. Profiles in ~/.mlx-serve/ablation load when the server starts." = "适用于任何应用发给此模型的每个请求。~/.mlx-serve/ablation 中的配置在服务器启动时加载。";
+"Remove this model's ablation setting" = "移除此模型的消融设置";
+"Strength from 0 to 1; 0 is off" = "强度范围为 0 到 1；0 为关闭";
