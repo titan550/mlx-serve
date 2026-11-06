@@ -22,6 +22,7 @@ const hcReadFused = @import("hc_fused.zig").hcReadFused;
 const hcReadJoined = @import("hc_fused.zig").hcReadJoined;
 const HcWeights = @import("weights.zig").HcWeights;
 const PleWeights = @import("weights.zig").PleWeights;
+const hc_decode2 = @import("../../sdk/blocks/hc/hc_decode2.zig");
 
 /// qwen4_exp: compile the four hyper-connection elementwise tails.
 pub fn compileQwen4Hc(self: *Trunk) void {
@@ -140,7 +141,7 @@ pub fn hcReadPending(self: *Trunk, h: *mlx.mlx_array, w: *const HcWeights, batch
             h.* = o.stream;
             return .{ .mixed = o.mixed, .inj = o.inj };
         }
-        h.* = try self.hcWrite(h.*, pd.out, pd.inj, batch, seq_len);
+        h.* = try self.hcWriteAblated(h.*, pd.out, pd.inj, batch, seq_len, pd.ablate);
     }
     return self.hcRead(h.*, w, batch, seq_len);
 }
@@ -156,13 +157,18 @@ pub fn hcReadFusedFor(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, 
     const hidden: c_int = @intCast(self.config.hidden_size);
     const hp = @import("../../sdk/blocks/hc/hc_prefill.zig");
     if (hp.eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(stream))) {
-        if (try hp.norm(self.s, stream, w.norm_w, w.inject_flat, self.rms_eps_arr, batch, seq_len, if (pend) |p| .{ .out = p.out, .inj = p.inj } else null)) |n| {
+        // The prefill norms have no ablation arm: they take the pending write's `out` projected.
+        const projected: ?mlx.mlx_array = if (pend) |p| (if (p.ablate) |ab| try hc_decode2.ablateOut(self.s, p.out, ab) else null) else null;
+        defer if (projected) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        if (try hp.norm(self.s, stream, w.norm_w, w.inject_flat, self.rms_eps_arr, batch, seq_len, if (pend) |p| .{ .out = projected orelse p.out, .inj = p.inj } else null)) |n| {
             defer n.deinit();
             var read = try self.hcReadNormed(n.normalized, w, batch, seq_len, n.raw_inject);
             errdefer read.deinit();
             return .{ .stream = try standinRef(n.stream), .mixed = read.mixed, .inj = read.inj };
         }
-        if (try @import("../../sdk/blocks/hc/hc_prefill_cuda.zig").norm(self.s, stream, w.norm_w, self.rms_eps_arr, batch, seq_len, if (pend) |p| .{ .out = p.out, .inj = p.inj } else null)) |n| {
+        if (try @import("../../sdk/blocks/hc/hc_prefill_cuda.zig").norm(self.s, stream, w.norm_w, self.rms_eps_arr, batch, seq_len, if (pend) |p| .{ .out = projected orelse p.out, .inj = p.inj } else null)) |n| {
             defer n.deinit();
             var read = try self.hcReadNormed(n.normalized, w, batch, seq_len, null);
             errdefer read.deinit();
@@ -180,8 +186,9 @@ pub fn hcReadFusedFor(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, 
 
 pub fn addVerifyPle(self: *Trunk, row: anytype, pw: *const PleWeights, layer: usize, index: usize) !void {
     try self.hcFlush(&row.h, 1, row.seq, &row.pending);
-    const add = try self.pleForward(row.ctx, row.h, row.tokens, pw, &row.entries[layer], layer, 1, row.seq);
+    var add = try self.pleForward(row.ctx, row.h, row.tokens, pw, &row.entries[layer], layer, 1, row.seq);
     defer _ = mlx.mlx_array_free(add);
+    if (row.ablation) |*ab| try ab.apply(self.s, &add, @intCast(self.config.hc_count));
     var with_ple = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(with_ple);
     if (comptime @import("builtin").is_test) {
@@ -192,7 +199,8 @@ pub fn addVerifyPle(self: *Trunk, row: anytype, pw: *const PleWeights, layer: us
     row.h = with_ple;
 }
 
-pub fn hcReadVerifyRows(self: *Trunk, rows: anytype, w: *const HcWeights) !?[]HcRead {
+/// `group` is the rows' ablation joined (`width` rows per slot), when one rides their pending writes.
+pub fn hcReadVerifyRows(self: *Trunk, rows: anytype, w: *const HcWeights, group: ?hc_decode2.Ablate) !?[]HcRead {
     if (self.qwen4 == null or self.config.hc_count != 4 or self.config.hidden_size != 2560 or rows.len < 2 or rows.len > 8) return null;
     const width = rows[0].seq;
     const has_pending = rows[0].pending != null;
@@ -200,6 +208,7 @@ pub fn hcReadVerifyRows(self: *Trunk, rows: anytype, w: *const HcWeights) !?[]Hc
     var pending: [8]HcPending = undefined;
     for (rows, 0..) |row, i| {
         if (row.seq != width or (row.pending != null) != has_pending) return null;
+        if (row.pending) |p| if ((p.ablate != null) != (group != null)) return null;
         inputs[i] = row.h;
         if (row.pending) |p| pending[i] = p;
     }
@@ -207,7 +216,7 @@ pub fn hcReadVerifyRows(self: *Trunk, rows: anytype, w: *const HcWeights) !?[]Hc
     const dqp: QuantParams = if (dense) .{ .bits = 16, .group_size = 16 } else self.quantParamsHinted(w.down_w, w.down_s, 10240);
     const uqp: QuantParams = if (dense) dqp else self.quantParamsHinted(w.up_w, w.up_s, upInputDim(w));
     if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
-    const joined = (try hcReadJoined(self.allocator, self.s, inputs[0..rows.len], w.*, width, self.config.rms_norm_eps, dqp.bits, dqp.group_size, if (has_pending) pending[0..rows.len] else null)) orelse return null;
+    const joined = (try hcReadJoined(self.allocator, self.s, inputs[0..rows.len], w.*, width, self.config.rms_norm_eps, dqp.bits, dqp.group_size, if (has_pending) pending[0..rows.len] else null, group)) orelse return null;
     defer self.allocator.free(joined);
     errdefer for (joined) |value| inline for (.{ "mixed", "inj", "stream" }) |name| {
         if (@field(value, name).ctx != null) _ = mlx.mlx_array_free(@field(value, name));
@@ -234,30 +243,36 @@ pub fn hcReadVerifyRows(self: *Trunk, rows: anytype, w: *const HcWeights) !?[]Hc
 }
 
 /// Defer `stream += out * inj` to the next read when the fused read will
-/// take it (decode/verify/batched widths); otherwise write now.
-pub fn hcWriteOrDefer(self: *Trunk, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, inject_flat: mlx.mlx_array, pending: *?HcPending) !void {
+/// take it (decode/verify/batched widths); otherwise write now. `ab` ablates
+/// `out` first (`Caps.ablation`), in the read that takes the write or here.
+pub fn hcWriteOrDefer(self: *Trunk, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, inject_flat: mlx.mlx_array, pending: *?HcPending, ab: ?hc_decode2.Ablate) !void {
     std.debug.assert(pending.* == null);
     const prefill = @import("../../sdk/blocks/hc/hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, inject_flat, mlx.mlx_array_dtype(h.*)) and mlx.mlx_array_dtype(inj) == .bfloat16;
     if ((prefill or (batch * seq_len <= HC_FUSED_MAX_ROWS and hcFusedEnabled())) and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
-        var pd: HcPending = undefined;
-        pd.out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(pd.out);
+        var pd: HcPending = .{ .out = mlx.mlx_array_new(), .inj = mlx.mlx_array_new(), .ablate = ab };
+        errdefer pd.deinit();
         try mlx.check(mlx.mlx_array_set(&pd.out, out));
-        pd.inj = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(pd.inj);
         try mlx.check(mlx.mlx_array_set(&pd.inj, inj));
         pending.* = pd;
         return;
     }
-    h.* = try self.hcWrite(h.*, out, inj, batch, seq_len);
+    h.* = try self.hcWriteAblated(h.*, out, inj, batch, seq_len, ab);
 }
 
 pub fn hcFlush(self: *Trunk, h: *mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
     if (pending.*) |*pd| {
         defer pending.* = null;
         defer pd.deinit();
-        h.* = try self.hcWrite(h.*, pd.out, pd.inj, batch, seq_len);
+        h.* = try self.hcWriteAblated(h.*, pd.out, pd.inj, batch, seq_len, pd.ablate);
     }
+}
+
+/// `hcWrite` with `out` ablated first when `ab` rides it. Consumes `stream`.
+pub fn hcWriteAblated(self: *Trunk, stream: mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, ab: ?hc_decode2.Ablate) !mlx.mlx_array {
+    const a = ab orelse return self.hcWrite(stream, out, inj, batch, seq_len);
+    const projected = try hc_decode2.ablateOut(self.s, out, a);
+    defer _ = mlx.mlx_array_free(projected);
+    return self.hcWrite(stream, projected, inj, batch, seq_len);
 }
 
 /// Grouped RMS norm over the last `hidden` of each of the `hc` streams:

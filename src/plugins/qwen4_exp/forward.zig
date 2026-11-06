@@ -42,6 +42,10 @@ const qwen4CompareRows = @import("../../sdk/testing/parity.zig").qwen4CompareRow
 const qwen4CompareTied = @import("../../sdk/testing/parity.zig").qwen4CompareTied;
 const qwen4ReadF32 = @import("../../sdk/testing/parity.zig").qwen4ReadF32;
 const HcRead = @import("hc.zig").HcRead;
+const hc_decode2 = @import("../../sdk/blocks/hc/hc_decode2.zig");
+const Ablation = @import("ablate.zig").Ablation;
+const servesAcross = @import("ablate.zig").servesAcross;
+const Request = @import("../../sdk/request/ablation.zig").Request;
 const HcPending = @import("hc_fused.zig").HcPending;
 const Qwen4Trace = @import("mtp.zig").Qwen4Trace;
 const PleArmFixture = @import("ple.zig").PleArmFixture;
@@ -109,20 +113,32 @@ pub fn forwardQwen4VerifyRows(
         generation: u64,
         h: mlx.mlx_array,
         pending: ?HcPending = null,
+        /// This slot's row of `group`.
+        ablation: ?Ablation = null,
     };
+    // Reached by symbol, past `Forward.ablation`: each slot's ablation is its engine context's; the joined reads take
+    // the group's rows at once.
+    var reqs: [MAX_BATCH_ROWS]?Request = undefined;
+    for (ctxs, 0..) |c, i| reqs[i] = c.ablation;
+    var group = try Ablation.fromRequests(self.allocator, reqs[0..ctxs.len], cfg.hidden_size);
+    defer if (group) |*g| g.deinit();
     var rows: [MAX_BATCH_ROWS]Row = undefined;
     var initialized: usize = 0;
     defer for (rows[0..initialized]) |*row| {
         if (row.pending) |*pending| pending.deinit();
         if (row.h.ctx != null) _ = mlx.mlx_array_free(row.h);
+        if (row.ablation) |*a| a.deinit();
     };
     var generation = self.fwd_gen;
     for (token_rows, ctxs, 0..) |tokens, ctx, i| {
         generation +%= 1;
         self.fwd_gen = generation;
         const seq = mlx.getShape(tokens)[1];
-        const emb = try self.embedding(tokens);
+        var ablation: ?Ablation = if (group) |*g| try g.slot(self.s, i) else null;
+        errdefer if (ablation) |*a| a.deinit();
+        var emb = try self.embedding(tokens);
         defer _ = mlx.mlx_array_free(emb);
+        if (ablation) |*a| try a.apply(self.s, &emb, 1);
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &.{ 1, 1, hc }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
@@ -140,9 +156,11 @@ pub fn forwardQwen4VerifyRows(
             .seq = seq,
             .generation = generation,
             .h = h,
+            .ablation = ablation,
         };
         initialized += 1;
     }
+    const joined_ab: ?hc_decode2.Ablate = if (group) |*g| g.pending(rows[0].seq) else null;
 
     self.spec_capture_ssm = true;
     defer self.spec_capture_ssm = false;
@@ -167,7 +185,7 @@ pub fn forwardQwen4VerifyRows(
             self.fwd_gen = row.generation;
             if (layer.ple) |*pw| try self.addVerifyPle(row, pw, layer_idx, i);
         }
-        const joined_attn = try self.hcReadVerifyRows(rows[0..initialized], &layer.hc_attn.?);
+        const joined_attn = try self.hcReadVerifyRows(rows[0..initialized], &layer.hc_attn.?, joined_ab);
         defer if (joined_attn) |values| {
             for (values) |*value| if (value.mixed.ctx != null) value.deinit();
             self.allocator.free(values);
@@ -192,7 +210,7 @@ pub fn forwardQwen4VerifyRows(
                     .full => |fa| try self.qwen4AttnWith(row.ctx, read.mixed, &fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                 };
                 defer _ = mlx.mlx_array_free(attn);
-                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, if (row.ablation) |*a| a.pending(row.seq) else null);
             }
         }
         if (group_projection) {
@@ -211,7 +229,7 @@ pub fn forwardQwen4VerifyRows(
                     .full => |*fa| try self.qwen4AttnWith(row.ctx, read.mixed, fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                 };
                 defer _ = mlx.mlx_array_free(attn);
-                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, if (row.ablation) |*a| a.pending(row.seq) else null);
             }
         }
 
@@ -219,7 +237,7 @@ pub fn forwardQwen4VerifyRows(
         var read_count: usize = 0;
         defer for (reads[0..read_count]) |*read| read.deinit();
         var inputs: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
-        const joined_mlp = try self.hcReadVerifyRows(rows[0..initialized], &layer.hc_mlp.?);
+        const joined_mlp = try self.hcReadVerifyRows(rows[0..initialized], &layer.hc_mlp.?, joined_ab);
         defer if (joined_mlp) |values| {
             for (values) |*value| if (value.mixed.ctx != null) value.deinit();
             self.allocator.free(values);
@@ -245,7 +263,7 @@ pub fn forwardQwen4VerifyRows(
         }
         for (rows[0..initialized], mlp, reads[0..initialized]) |*row, value, read| {
             self.fwd_gen = row.generation;
-            try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+            try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, if (row.ablation) |*a| a.pending(row.seq) else null);
         }
     }
 
@@ -356,6 +374,12 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
     self.spec_capture_ssm = ctx.capture_ssm_seq;
     defer self.spec_capture_ssm = false;
 
+    // The plugin's ablation (`Forward.ablation`), else the engine context's where the engine calls the trunk by symbol.
+    var from_ctx = if (self.ablation == null) try Ablation.fromRequests(self.allocator, &.{ctx.ablation}, cfg.hidden_size) else null;
+    defer if (from_ctx) |*v| v.deinit();
+    const abl: ?*const Ablation = self.ablation orelse if (from_ctx) |*v| v else null;
+    if (abl != null and !servesAcross(self.dist_peer != null, self.dist_tp != null)) return error.AblationAcrossCluster;
+
     var h = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(h);
     if (stream_in) |st| {
@@ -369,6 +393,7 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
             emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
         }
         defer _ = mlx.mlx_array_free(emb);
+        if (abl) |a| try a.apply(self.s, &emb, 1);
         const reps = [_]c_int{ 1, 1, hc };
         try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
     }
@@ -376,6 +401,7 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
     const batch: c_int = x_shape[0];
     const seq_len: c_int = x_shape[1];
     const is_prefill = seq_len > 1;
+    const write_ab: ?hc_decode2.Ablate = if (abl) |a| a.pending(seq_len) else null;
 
     if (self.qwen4_stream_f32 or env.onCached(&qwen4_stream_f32_env, .QWEN4_STREAM_F32)) {
         var h32 = mlx.mlx_array_new();
@@ -413,8 +439,9 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
 
         if (lw.ple) |*pw| {
             try self.hcFlush(&h, batch, seq_len, &pending);
-            const add = try self.pleForward(ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
+            var add = try self.pleForward(ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
             defer _ = mlx.mlx_array_free(add);
+            if (abl) |a| try a.apply(self.s, &add, hc);
             var h_ple = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_add(&h_ple, h, add, self.s));
             _ = mlx.mlx_array_free(h);
@@ -438,7 +465,7 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
             Qwen4Trace.set(&tr.inj_attn, pre.inj);
             Qwen4Trace.set(&tr.attn_out, attn_out);
         };
-        if (si.hc) h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending);
+        if (si.hc) h = try self.hcWriteAblated(h, attn_out, pre.inj, batch, seq_len, write_ab) else try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending, write_ab);
         if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
         try prof.lap(h, .hc_write);
 
@@ -456,7 +483,7 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
             Qwen4Trace.set(&tr.inj_mlp, pre2.inj);
             Qwen4Trace.set(&tr.mlp_out, mlp_out);
         };
-        if (si.hc) h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) ml[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null }, &pending);
+        if (si.hc) h = try self.hcWriteAblated(h, mlp_out, pre2.inj, batch, seq_len, write_ab) else try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) ml[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null }, &pending, write_ab);
         if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
         try prof.lap(h, .hc_write);
         prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);

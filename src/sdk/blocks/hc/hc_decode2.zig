@@ -10,8 +10,13 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
 
-/// A deferred hcWrite the norm launch applies itself: stream + out * inj.
-pub const Pending = struct { out: mlx.mlx_array, inj: mlx.mlx_array };
+/// Directional ablation of a pending write (`abi.Ablation`): row r's `out` loses `strengths[r / per]` times its component
+/// along row `r / per` of `dirs` before the write; `dirs` [slots, hidden] and `strengths` [slots] are f32. Borrowed
+/// handles: a pending write never outlives its forward.
+pub const Ablate = struct { dirs: mlx.mlx_array, strengths: mlx.mlx_array, per: c_int };
+
+/// A deferred hcWrite the norm launch applies itself: stream + out * inj, `out` ablated first when `ablate` rides it.
+pub const Pending = struct { out: mlx.mlx_array, inj: mlx.mlx_array, ablate: ?Ablate = null };
 
 /// Flat results: mixed [hidden], inj [hc] (null-ctx without inject weights), stream [hc*hidden]
 /// (null-ctx without a pending write).
@@ -35,10 +40,13 @@ pub const U2_SOURCE = kernelSource("kernels/hc/hc_decode2_u2.metal");
 pub const U2V_SOURCE = kernelSource("kernels/hc/hc_decode2_u2v.metal");
 
 var engaged = false;
+var ablate_engaged = false;
 /// Reads served by the two launches (the tests assert the path engaged).
 pub var served: u64 = 0;
 /// Of those, reads whose up launch took the vectorized kernel.
 pub var served_vec: u64 = 0;
+/// Of those, reads whose norm launch ablated the pending write.
+pub var ablate_served: u64 = 0;
 
 pub var rows_override: ?c_int = null;
 /// Widest read the two launches serve (the verify widths and batched slots).
@@ -99,7 +107,7 @@ fn run(kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config,
     }
 }
 
-const Key = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: c_int, dtype: mlx.mlx_dtype, rows: c_int };
+const Key = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, ab: c_int, per: c_int, bits: u32, gs: c_int, dtype: mlx.mlx_dtype, rows: c_int };
 const Armed = struct { key: Key, nd: mlx.mlx_fast_metal_kernel_config, up: mlx.mlx_fast_metal_kernel_config, upv: ?mlx.mlx_fast_metal_kernel_config };
 var nd_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var up_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -134,9 +142,61 @@ fn aligned16(a: mlx.mlx_array) bool {
     return @intFromPtr(p) % 16 == 0;
 }
 
+/// `ab` fits a read of `rows` rows of `hidden`: whole slots of `per` rows, each with its f32 direction and strength.
+fn ablateFits(ab: Ablate, rows: c_int, hidden: c_int) bool {
+    if (ab.per < 1 or @rem(rows, ab.per) != 0 or ab.dirs.ctx == null or ab.strengths.ctx == null) return false;
+    if (mlx.mlx_array_dtype(ab.dirs) != .float32 or mlx.mlx_array_dtype(ab.strengths) != .float32) return false;
+    const slots: usize = @intCast(@divExact(rows, ab.per));
+    return mlx.mlx_array_size(ab.dirs) == slots * @as(usize, @intCast(hidden)) and mlx.mlx_array_size(ab.strengths) == slots;
+}
+
+/// What the folded launch does to `out` (`ab.per` rows per slot, any leading shape over `hidden`-wide rows): each row
+/// loses its slot's strength times its component along its slot's direction, in f32 with one rounding back to `out`'s
+/// dtype, as the launch rounds. The caller frees the result.
+pub fn ablateOut(s: mlx.mlx_stream, out: mlx.mlx_array, ab: Ablate) !mlx.mlx_array {
+    const shape = mlx.getShape(out);
+    const hidden = shape[shape.len - 1];
+    const slots: c_int = @intCast(mlx.mlx_array_size(ab.strengths));
+    var o3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o3);
+    try mlx.check(mlx.mlx_reshape(&o3, out, &[_]c_int{ slots, -1, hidden }, 3, s));
+    var d3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d3);
+    try mlx.check(mlx.mlx_reshape(&d3, ab.dirs, &[_]c_int{ slots, 1, hidden }, 3, s));
+    var s3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(s3);
+    try mlx.check(mlx.mlx_reshape(&s3, ab.strengths, &[_]c_int{ slots, 1, 1 }, 3, s));
+    var o32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o32);
+    try mlx.check(mlx.mlx_astype(&o32, o3, .float32, s));
+    var prod = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(prod);
+    try mlx.check(mlx.mlx_multiply(&prod, o32, d3, s));
+    var dot = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dot);
+    try mlx.check(mlx.mlx_sum_axis(&dot, prod, -1, true, s));
+    var coef = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coef);
+    try mlx.check(mlx.mlx_multiply(&coef, dot, s3, s));
+    var sub = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sub);
+    try mlx.check(mlx.mlx_multiply(&sub, coef, d3, s));
+    var moved = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(moved);
+    try mlx.check(mlx.mlx_subtract(&moved, o32, sub, s));
+    var cast = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cast);
+    try mlx.check(mlx.mlx_astype(&cast, moved, mlx.mlx_array_dtype(out), s));
+    var res = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(res);
+    try mlx.check(mlx.mlx_reshape(&res, cast, shape.ptr, @intCast(shape.len), s));
+    return res;
+}
+
 /// The two-launch read of `rows` rows, or null outside its envelope (the caller keeps the
 /// unfused chain). `dw` [R, K/vpw] and `uw` [K, R/vpw] are the packed projections with
-/// scales and biases in x's dtype, `iw` the dense [K, hc] inject weight or null-ctx.
+/// scales and biases in x's dtype, `iw` the dense [K, hc] inject weight or null-ctx. A pending
+/// write's ablation is applied to its `out` before the write (`Ablate`).
 pub fn read(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -181,10 +241,14 @@ pub fn read(
     const inj: c_int = @intFromBool(iw.ctx != null);
     const wr: c_int = @intFromBool(pend != null);
     if (rows < 1 or mlx.mlx_array_size(x) != @as(usize, @intCast(rows * K)) or mlx.mlx_array_size(nw) != @as(usize, @intCast(K))) return null;
+    const abl: ?Ablate = if (pend) |p| p.ablate else null;
+    if (abl) |v| if (!ablateFits(v, rows, hidden)) return null;
+    const ab: c_int = @intFromBool(abl != null);
+    const per: c_int = if (abl) |v| v.per else 1;
 
-    const key = Key{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = gs, .dtype = dt, .rows = rows };
+    const key = Key{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .ab = ab, .per = per, .bits = bits, .gs = gs, .dtype = dt, .rows = rows };
     if (nd_kernel == null) {
-        const ins = [_][*:0]const u8{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in", "dw_q", "dw_s", "dw_b" };
+        const ins = [_][*:0]const u8{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in", "ad_in", "as_in", "dw_q", "dw_s", "dw_b" };
         const outs = [_][*:0]const u8{ "xn_out", "parts_out", "xs_out" };
         nd_kernel = try makeKernel("mlxserve_hc_read_nd", &ins, &outs, ND_SOURCE);
     }
@@ -203,7 +267,7 @@ pub fn read(
         if (a != null and std.meta.eql(a.?.key, key)) break a.?;
     } else blk: {
         const groups = @divExact(R, ROWS_TG) + inj;
-        const nd = try config(&.{ .{ rows * K, dt }, .{ rows * hc * pr, .float32 }, .{ if (wr == 1) rows * K else 1, dt } }, .{ 256, groups * hc, rows }, 256, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "WR", wr }, .{ "RPS", RPS }, .{ "ROWS_TG", ROWS_TG } }, dt);
+        const nd = try config(&.{ .{ rows * K, dt }, .{ rows * hc * pr, .float32 }, .{ if (wr == 1) rows * K else 1, dt } }, .{ 256, groups * hc, rows }, 256, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "WR", wr }, .{ "RPS", RPS }, .{ "ROWS_TG", ROWS_TG }, .{ "AB", ab }, .{ "SEQ", per } }, dt);
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(nd);
         const up = try config(&.{ .{ rows * hidden, dt }, .{ rows * hc, dt } }, .{ 32 * COLS_TG, @divExact(hidden, COLS_TG), rows }, 32 * COLS_TG, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "COLS", COLS_TG } }, dt);
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(up);
@@ -224,9 +288,10 @@ pub fn read(
     var nd_out: [3]mlx.mlx_array = undefined;
     const wo = if (pend) |p| p.out else nw;
     const wi = if (pend) |p| p.inj else nw;
-    // Dense weights carry no scales; the kernel never reads the operands bound in their place.
+    // Dense weights carry no scales, and an unablated write has no directions: the kernel never reads the operands bound
+    // in their place.
     const dsb: [4]mlx.mlx_array = if (dense) .{ nw, nw, nw, nw } else .{ ds, db, us, ub };
-    try run(nd_kernel.?, cfgs.nd, &.{ x, nw, if (inj == 1) iw else nw, eps, wo, wi, dw, dsb[0], dsb[1] }, s, &nd_out);
+    try run(nd_kernel.?, cfgs.nd, &.{ x, nw, if (inj == 1) iw else nw, eps, wo, wi, if (abl) |v| v.dirs else nw, if (abl) |v| v.strengths else eps, dw, dsb[0], dsb[1] }, s, &nd_out);
     defer _ = mlx.mlx_array_free(nd_out[0]);
     defer _ = mlx.mlx_array_free(nd_out[1]);
     errdefer _ = mlx.mlx_array_free(nd_out[2]);
@@ -252,5 +317,12 @@ pub fn read(
         log.info("[qwen4] two-launch hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d}\n", .{ hc, hidden, R, bits, group_size });
     }
     served += 1;
+    if (ab == 1) {
+        ablate_served += 1;
+        if (!ablate_engaged) {
+            ablate_engaged = true;
+            log.info("[qwen4] directional ablation folded into the hyper-connection read ({d} rows per slot)\n", .{per});
+        }
+    }
     return .{ .mixed = upmix[0], .inj = inj_out, .stream = stream };
 }
