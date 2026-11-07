@@ -147,7 +147,9 @@ YM="$(TZ=America/New_York date +%y.%-m)"
 if [ "$FAST_DEV" = "1" ] || [ "$IDENTITY" = "-" ]; then
     # Reuse whatever version the plist already carries. It is only read back by
     # UpdateChecker, which has nothing to compare against on a dev build.
+    # MLX_SERVE_DEV_VERSION names a fork's build instead: the plugin kit is matched by this string.
     CALVER="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST_SRC" 2>/dev/null || echo "${YM}.0")"
+    CALVER="${MLX_SERVE_DEV_VERSION:-$CALVER}"
 else
     # `gh` is the only thing that knows what has already been published, so its
     # failure is not defaultable. It used to end in `|| echo "0"`, which turns a
