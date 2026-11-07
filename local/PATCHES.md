@@ -99,4 +99,6 @@ count is F1's 2 lines.
 
 ## Outside plugins reviewed (CHANGE-POLICY §4 L2)
 - `sushi_ds41` @ CommunityServe/plugins `59473a90` (plugin last touched `203ed90`, 2026-11-05): PASS
-  2026-11-06. Details in `local/notes/roadmap-2026-11-06.md` step 1.
+  2026-11-06. Details in `local/notes/roadmap-2026-11-06.md` step 1. Pinned in `local/plugins.conf` at
+  `00f9bec` (2026-11-07; the delta from `59473a90` is `plugin.json` title/homepage/icon metadata and an
+  `icon.png`, no code). Installed by `local/build.sh plugins` 2026-11-07, sha256 `4804d9cd…`.
