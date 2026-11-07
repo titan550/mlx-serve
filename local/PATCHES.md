@@ -20,8 +20,11 @@ count is F1's 2 lines.
 - Upstream: yes, later ("a dev build may name its version"); the better upstream shape is the app offering
   a dev build's own kit, which needs no env var.       If declined: carry (2 lines).
 - Drop when: upstream's Install flow uses `zig-out/kit` or `~/.mlx-serve/kit` for a non-release version.
-- Notes: version is `<tag>.<commits since tag>` so UpdateChecker (numeric compare) stays quiet about this
-  build and still offers the next release.
+- Notes: version is `<tag>+fork.<commits since tag>` (e.g. `26.11.2+fork.12`). It must be semver: a plugin's
+  `build.zig.zon` names the kit as a dependency and Zig refused `26.11.2.12` (first install attempt,
+  2026-11-07). `+` metadata is what UpdateChecker ignores: no nag about this build, and no update offers
+  either; the fork adopts releases by hand (CHANGE-POLICY §6). A `-` suffix would sort below the release
+  and nag forever.
 
 ### CR-A — qwen4_exp serves directional ablation (`Caps.ablation`)
 - Level: L5          Status: active, PR pending the owner's review
