@@ -320,7 +320,9 @@ pub fn resolve(set: ?*const Set, v: std.json.Value, presented_key: ?[]const u8, 
         .ok => |f| f,
         .bad => |m| return bad(m),
     };
-    if (f.prefix == .shared) return bad("ablation.prefix_cache \"shared\" is the server's setting; a request may ask for \"read\" or \"isolated\"");
+    // Nothing a request could ask for here differs from the default: `isolated` is what a request gets, and `shared`
+    // is the model's setting (the operator's call, since it lets one request's KV serve another).
+    if (f.prefix != null) return bad("ablation.prefix_cache is the model's setting; a request may not name it");
     return select(s, f, served, msg_buf);
 }
 
@@ -629,7 +631,8 @@ test "ablation request: every refusal row of the failure matrix, and the key nev
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = .{ .hidden = 4, .serves = false, .config_sha256 = sha }, .code = 400, .says = "does not serve" },
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = .{ .hidden = 8, .serves = true, .config_sha256 = sha }, .code = 400, .says = "hidden size" },
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = other, .code = 400, .says = "digest differs" },
-        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"shared\"}", .key = test_key, .served = served, .code = 400, .says = "the server's setting" },
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"shared\"}", .key = test_key, .served = served, .code = 400, .says = "the model's setting" },
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"isolated\"}", .key = test_key, .served = served, .code = 400, .says = "the model's setting" },
         .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"warm\"}", .key = test_key, .served = served, .code = 400, .says = "prefix_cache must be" },
         .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":1}", .key = test_key, .served = served, .code = 400, .says = "prefix_cache must be" },
     };
@@ -650,10 +653,8 @@ test "ablation request: every refusal row of the failure matrix, and the key nev
     try testing.expect(zero == .selected and zero.selected.strength == 0);
     const dflt = resolve(&set, try json(a, "{\"profile\":\"good\"}"), test_key, served, &buf);
     try testing.expect(dflt == .selected and dflt.selected.strength == 1.0 and dflt.selected.request().prefix == default_prefix);
-    inline for (.{ .{ "read", Prefix.read }, .{ "isolated", Prefix.isolated } }) |c| {
-        const named = resolve(&set, try json(a, "{\"profile\":\"good\",\"prefix_cache\":\"" ++ c[0] ++ "\"}"), test_key, served, &buf);
-        try testing.expect(named == .selected and named.selected.request().prefix == c[1]);
-    }
+    // A request that names no cache mode runs isolated, the default (the mode is the model's setting).
+    try testing.expect(run.selected.request().prefix == default_prefix);
 }
 
 fn settingOf(a: std.mem.Allocator, text: []const u8) !AblationSetting {

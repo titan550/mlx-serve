@@ -182,11 +182,13 @@ final class AblationControlTests: XCTestCase {
         XCTAssertEqual(control(nil).choosing("beta").strength, 0, "picking a profile does not turn it on")
     }
 
-    /// No key runs isolated, the server's default; "read" shares nothing back either.
+    /// No key runs isolated, the server's default; "shared" is the only value that reuses.
     func testTheCacheToggleShowsWhatTheServerDoes() {
         XCTAssertFalse(control(AblationSetting(profile: "alpha")).reusesPrefixCache)
-        XCTAssertFalse(control(AblationSetting(profile: "alpha", prefixCache: "read")).reusesPrefixCache)
+        XCTAssertFalse(control(AblationSetting(profile: "alpha", prefixCache: "isolated")).reusesPrefixCache)
         XCTAssertTrue(control(AblationSetting(profile: "alpha", prefixCache: "shared")).reusesPrefixCache)
+        // The memberwise init takes any string; the JSON one is the path a stored setting comes in by.
+        XCTAssertNil(AblationSetting(json: ["profile": "alpha", "prefix_cache": "read"]), "the server no longer has that mode")
     }
 
     func testAStoredProfileTheServerNoLongerListsStaysAChoice() {

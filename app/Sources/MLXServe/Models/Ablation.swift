@@ -7,7 +7,7 @@ import Security
 struct AblationSetting: Equatable {
     var profile: String
     var strength: Double = 1
-    /// "isolated", "read" or "shared"; nil runs the server's default (isolated).
+    /// "isolated" or "shared"; nil runs the server's default (isolated).
     var prefixCache: String?
 
     init(profile: String, strength: Double = 1, prefixCache: String? = nil) {
@@ -30,7 +30,7 @@ struct AblationSetting: Equatable {
             strength = n.doubleValue
         }
         if let p = o["prefix_cache"] {
-            guard let p = p as? String, ["isolated", "read", "shared"].contains(p) else { return nil }
+            guard let p = p as? String, ["isolated", "shared"].contains(p) else { return nil }
             prefixCache = p
         }
     }
