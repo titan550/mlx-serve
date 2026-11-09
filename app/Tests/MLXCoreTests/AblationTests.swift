@@ -196,11 +196,23 @@ final class AblationControlTests: XCTestCase {
         XCTAssertEqual(control(AblationSetting(profile: "beta")).choices, profiles)
     }
 
+    /// A stored strength above 1 is one the server accepts: reading it must not drop the setting, and a save must
+    /// write it back unchanged (`ModelOverride` keeps what the app cannot read only when `init?` refuses it).
+    func testAStoredStrengthAboveOneSurvivesARead() {
+        XCTAssertEqual(AblationSetting(json: ["profile": "p", "strength": 4]),
+                       AblationSetting(profile: "p", strength: 4))
+        XCTAssertEqual(AblationSetting(json: ["profile": "p", "strength": 30])?.json["strength"] as? Double, 30)
+        XCTAssertNil(AblationSetting(json: ["profile": "p", "strength": 31]), "above the server's cap")
+    }
+
     func testOnlyAStrengthTheServerAcceptsIsWritten() {
         XCTAssertEqual(AblationControl.parseStrength(" 0.5 "), 0.5)
         XCTAssertEqual(AblationControl.parseStrength("1"), 1)
         XCTAssertEqual(AblationControl.parseStrength("0"), 0)
-        for bad in ["", "abc", "-0.1", "1.01", "nan", "inf"] {
+        // Above 1 an ablation overrides a behaviour the model holds strongly (the server accepts up to 30).
+        XCTAssertEqual(AblationControl.parseStrength("4"), 4)
+        XCTAssertEqual(AblationControl.parseStrength("30"), 30)
+        for bad in ["", "abc", "-0.1", "30.01", "nan", "inf"] {
             XCTAssertNil(AblationControl.parseStrength(bad), bad)
         }
         XCTAssertEqual(AblationControl.format(1), "1")

@@ -16,7 +16,7 @@ struct AblationSetting: Equatable {
         self.prefixCache = prefixCache
     }
 
-    /// nil unless the server can read it too: a profile, a strength in 0...1, a known `prefix_cache` and no other key.
+    /// nil unless the server can read it too: a profile, a strength in 0...30, a known `prefix_cache` and no other key.
     /// `ModelOverride` keeps anything else verbatim, so a save never rewrites what the app cannot read.
     init?(json: Any) {
         guard let o = json as? [String: Any],
@@ -26,7 +26,7 @@ struct AblationSetting: Equatable {
         if let s = o["strength"] {
             // A JSON bool bridges to NSNumber too.
             guard let n = s as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
-                  n.doubleValue >= 0, n.doubleValue <= 1 else { return nil }
+                  n.doubleValue >= 0, n.doubleValue <= AblationControl.maxStrength else { return nil }
             strength = n.doubleValue
         }
         if let p = o["prefix_cache"] {
@@ -157,13 +157,17 @@ struct AblationControl {
         return s
     }
 
-    /// A typed strength the server accepts (0...1), else nil.
+    /// A typed strength the server accepts (0...maxStrength), else nil.
     static func parseStrength(_ text: String) -> Double? {
-        guard let v = Double(text.trimmingCharacters(in: .whitespaces)), v >= 0, v <= 1 else { return nil }
+        guard let v = Double(text.trimmingCharacters(in: .whitespaces)), v >= 0, v <= maxStrength else { return nil }
         return v
     }
 
     static func format(_ strength: Double) -> String { String(format: "%g", strength) }
+
+    /// The strongest strength the server accepts (`max_strength` in `sdk/request/ablation.zig`): above 1 an ablation
+    /// overrides a behaviour the model holds strongly, which is what clearing a refusal takes.
+    static let maxStrength: Double = 30
 
     /// The menu bar's profile menu sizes to its title: a long folder name is cut in the middle to fit the panel.
     static func menuTitle(_ profile: String, limit: Int = 18) -> String {

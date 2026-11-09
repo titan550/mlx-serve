@@ -5,7 +5,8 @@ const std = @import("std");
 pub const Request = struct {
     /// The profile's unit direction, `[hidden]` f32; owned by the server's profile set, which outlives every request.
     direction: []const f32,
-    /// In (0, 1]: a strength of 0 never reaches the engine (the request runs as a standard one).
+    /// In [0, 30]: 0 never reaches the engine (the request runs as a standard one); above 1 an ablation overrides a
+    /// built-in behaviour the model holds strongly (measured: 1 leaves most refusals standing, 3-4 clears them).
     strength: f32,
     /// The profile's content hash with the strength folded in (`abi.Ablation.key`).
     key: u64,
@@ -19,6 +20,11 @@ pub const Request = struct {
 pub const Prefix = enum { isolated, read, shared };
 
 /// An `ablation` object as a request body or a model setting spells it; `profile` borrows from the JSON.
+/// The strongest ablation a request or a model setting may ask for. Above 1 the projection removes more than the
+/// component along the direction, which is what overriding a strongly held behaviour takes; 30 is far past any
+/// measurement and keeps a typo from clearing the whole stream.
+pub const max_strength: f32 = 30;
+
 pub const Field = struct { profile: []const u8, strength: f32 = 1, prefix: ?Prefix = null };
 
 pub const Parsed = union(enum) { ok: Field, bad: []const u8 };
@@ -38,10 +44,10 @@ pub fn parseField(v: std.json.Value, msg_buf: []u8) Parsed {
     if (name_v != .string) return .{ .bad = "ablation.profile must be a string" };
     const strength: f32 = if (v.object.get("strength")) |sv| switch (sv) {
         .float => |f| @floatCast(f),
-        .integer => |i| if (i >= 0 and i <= 1) @floatFromInt(i) else -1,
-        else => return .{ .bad = "ablation.strength must be a number in [0, 1]" },
+        .integer => |i| if (i >= 0 and i <= max_strength) @floatFromInt(i) else -1,
+        else => return .{ .bad = "ablation.strength must be a number in [0, 30]" },
     } else 1.0;
-    if (!(strength >= 0 and strength <= 1)) return .{ .bad = "ablation.strength must be a number in [0, 1]" };
+    if (!(strength >= 0 and strength <= max_strength)) return .{ .bad = "ablation.strength must be a number in [0, 30]" };
     const prefix: ?Prefix = if (v.object.get("prefix_cache")) |pv| blk: {
         if (pv == .string) if (std.meta.stringToEnum(Prefix, pv.string)) |p| break :blk p;
         return .{ .bad = "ablation.prefix_cache must be \"isolated\", \"read\" or \"shared\"" };
@@ -60,12 +66,17 @@ test "ablation field: the three keys, their defaults, and each malformed value n
     try std.testing.expectEqual(@as(?Prefix, .read), full.ok.prefix);
     const bare = parseField(try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"profile\":\"p\"}", .{}), &buf);
     try std.testing.expect(bare.ok.strength == 1 and bare.ok.prefix == null);
+    // Above 1 a strength is a refusal override, and it parses (the measured range for clearing a refusal is 3-4).
+    const strong = parseField(try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"profile\":\"p\",\"strength\":4}", .{}), &buf);
+    try std.testing.expectEqual(@as(f32, 4), strong.ok.strength);
+    const top = parseField(try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"profile\":\"p\",\"strength\":30}", .{}), &buf);
+    try std.testing.expectEqual(@as(f32, 30), top.ok.strength);
     const cases = [_][2][]const u8{
         .{ "7", "must be an object" },
         .{ "{\"profile\":\"p\",\"strenght\":1}", "unknown field 'ablation.strenght'" },
         .{ "{\"strength\":1}", "profile is required" },
         .{ "{\"profile\":1}", "must be a string" },
-        .{ "{\"profile\":\"p\",\"strength\":2}", "[0, 1]" },
+        .{ "{\"profile\":\"p\",\"strength\":31}", "[0, 30]" },
         .{ "{\"profile\":\"p\",\"prefix_cache\":\"warm\"}", "prefix_cache must be" },
     };
     for (cases) |c| {
