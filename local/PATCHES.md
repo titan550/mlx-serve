@@ -145,7 +145,9 @@ count is F1's 2 lines.
   2026-11-06. Details in `local/notes/roadmap-2026-11-06.md` step 1. Pinned in `local/plugins.conf` at
   `00f9bec` (2026-11-07; the delta from `59473a90` is `plugin.json` title/homepage/icon metadata and an
   `icon.png`, no code). Installed by `local/build.sh plugins` 2026-11-07, sha256 `4804d9cd…`.
-- `sushi_ds41` @ CommunityServe/plugins `e4787bc` (2026-11-08): per-layer ablation bank. The forward's
+- `sushi_ds41` @ CommunityServe/plugins `e09865e` (2026-11-09): single-direction ablation; the per-layer bank
+  is reverted (measured worse, CR-F) and kept on branch `feature/per-layer-bank` in the plugin checkout. The
+  strength cap follows the host's `max_strength` (30). Superseded text of the bank entry follows. The forward's
   ablation now carries the profile's directory name (a new `name` field on the fork's `abi.Ablation`,
   threaded host→engine→plugin), so the plugin loads that profile's per-layer `bank.f32` (one direction per
   capture site) instead of projecting one shared direction at every site; a profile with no bank file falls
