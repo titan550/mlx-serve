@@ -44,17 +44,19 @@ count is F1's 2 lines.
 - Notes: a direction built with thinking off does nothing with thinking on (STRML, #1045); rebuild with
   thinking on (roadmap).
 
-### CR-B — `prefix_cache`: isolated | read | shared for ablated requests
-- Level: L5          Status: active, PR pending the owner's review. **`read` is unused** — nothing sets it but a
-  request naming it, and the app writes `shared`/`isolated` only. Its code path (no checkout, restore by copy) is
-  sound but unreachable in practice: judgement call, drop `read` or keep it as the "reuse and never donate" arm.
+### CR-B — `prefix_cache`: isolated | shared for ablated requests (two modes)
+- Level: L5          Status: active (revised 2026-11-09), PR pending the owner's review
+- Revision: `read` dropped (merged `0846990c`) — it had no consumer beyond a request naming it. With it gone a
+  request has nothing left to choose (`isolated` is what it gets; `shared` is the operator's call because it
+  lets one request's KV serve another), so the request-level `prefix_cache` field is a named 400 and the mode
+  lives only in the model setting. That removes `reads_base_prefix` and its four engine branches.
 - Why: an ablated mid-session turn must reuse the unsteered prefix (a feature: no re-prefill for a long
   session); upstream isolates by default.
 - Branch: `ablation/prefix-cache`       Files touched: `src/sdk/request/ablation.zig`, engine `slot.zig`,
   `prefill.zig`, `prefill_interleave.zig`, `host/api/ablation.zig`, `docs/api.md`, deepseek_v4
   `served_test.zig`       Upstream-file lines: +248/−269
 - Conflict points: `prefill.zig` checkout/restore path; `slot.cache_variant`.
-- Off switch: default `isolated` upstream; the fork's model setting picks `read`/`shared`.
+- Off switch: default `isolated` upstream; the fork's model setting picks `shared`.
 - Tests: served test on llama's conformance fixture; prefix cache suites.
 - Upstream: yes (PR B).       If declined: carry; or reshape so the model setting alone selects it.
 - Drop when: upstream adopts a cache-reuse mode for ablation.
@@ -91,6 +93,11 @@ count is F1's 2 lines.
 - Conflict points: the strength parse in `sdk/request/ablation.zig`; the app's `AblationSetting` bounds.
 - Tests: `zig build test -Dtest-filter="ablation"` 77/77; `AblationControlTests` 11/11 including a new case
   that a stored strength above 1 survives a read.
+- Measured on the FULL held sets (99 harmful / 100 benign, sequential, thinking off, Sushi-STQ-1.75bpw,
+  single direction captured thinking off): no ablation 97/99 (0.98) and 8/100 (0.08); strength 3 at layer 37
+  6/99 (0.061) and 4/100 (0.04); **strength 4 at layer 37 4/99 (0.04) and 2/100 (0.02)** — adopted as the
+  model's setting. A "never refuse" system prompt stacked on strength 3 was 9/99 (0.091) against strength 3's
+  6/99: no help, within noise. A per-layer bank at strength 4 was 7/15 and 2/10 on the screening set (CR-F).
 - Upstream: yes, and it is the best single candidate (2 lines of behaviour, with numbers).
 - Drop when: upstream's `Ablation` range changes on its own.
 
