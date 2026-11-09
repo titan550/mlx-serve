@@ -45,7 +45,9 @@ count is F1's 2 lines.
   thinking on (roadmap).
 
 ### CR-B — `prefix_cache`: isolated | read | shared for ablated requests
-- Level: L5          Status: active, PR pending the owner's review
+- Level: L5          Status: active, PR pending the owner's review. **`read` is unused** — nothing sets it but a
+  request naming it, and the app writes `shared`/`isolated` only. Its code path (no checkout, restore by copy) is
+  sound but unreachable in practice: judgement call, drop `read` or keep it as the "reuse and never donate" arm.
 - Why: an ablated mid-session turn must reuse the unsteered prefix (a feature: no re-prefill for a long
   session); upstream isolates by default.
 - Branch: `ablation/prefix-cache`       Files touched: `src/sdk/request/ablation.zig`, engine `slot.zig`,
@@ -74,6 +76,40 @@ count is F1's 2 lines.
 - Drop when: upstream has a server-side default for ablation.
 - Notes: steering-lab's "off" arms are ablated by this setting until the lab sends strength 0.
 
+### CR-E — ablation strength above 1 (one constant, `max_strength = 30`)
+- Level: L4          Status: active, merged to `fork-main` 2026-11-08 (`e5b705ba`)
+- Why: upstream documents a strength in (0, 1]. Measured on Sushi-STQ-1.75bpw, one direction, thinking off:
+  s=1 leaves 11/15 refusing, s=2 5/15, s=3 1/15, s=4 0/15, with 0/10 benign over-refusals at every step.
+  With the upstream cap the feature cannot clear a refusal this model holds strongly, which is the whole
+  point of using it.
+- Files touched: `src/sdk/request/ablation.zig` (`max_strength`, the parse and its tests),
+  `src/host/api/ablation.zig` (the refusal matrix's sentence), `app/Sources/MLXServe/Models/Ablation.swift`
+  (the same bound, so a stored 4 is neither refused nor dropped on save), `app/Tests/…/AblationTests.swift`.
+  Upstream-file lines: ~40.
+- Off switch: none needed — a strength in [0, 1] behaves exactly as before; the cap only widens what is
+  accepted. A server without it refuses the value with its old sentence.
+- Conflict points: the strength parse in `sdk/request/ablation.zig`; the app's `AblationSetting` bounds.
+- Tests: `zig build test -Dtest-filter="ablation"` 77/77; `AblationControlTests` 11/11 including a new case
+  that a stored strength above 1 survives a read.
+- Upstream: yes, and it is the best single candidate (2 lines of behaviour, with numbers).
+- Drop when: upstream's `Ablation` range changes on its own.
+
+### CR-F — `abi.Ablation.name` (the profile's directory name, so a plugin can load a per-layer bank)
+- Level: L5          Status: **DROPPED, not built** (2026-11-08)
+- Why it was proposed: an outside plugin (`sushi_ds41`) wanted to load a per-layer `bank.f32` by profile name;
+  upstream's `Ablation` carries only `directions`/`strengths`/`keys`.
+- Why dropped: the per-layer bank measured WORSE than the single direction upstream already ships. Same 25
+  prompts, sequential, Sushi-STQ-1.75bpw thinking off: bank (31 of 41 sites) at strength 4 leaves 7/15
+  refusals and 2/10 benign over-refusals; one direction at layer 30/37/38 at strength 3-4 leaves 0/15 and
+  0/10. A DM profile is broadcast to every site by the plugin, so "single direction everywhere" and "bank"
+  edit the same sites; the only difference is per-site directions, and per-site unit normalization lifts
+  early-layer noise (norm ~30-42 below site 20, ~68-97 in the signal band) to full strength.
+- Consequence: no ABI change, and the plugin's bank path (`bankFor`/`loadBank`/`bankArray`, the site-indexed
+  `siteDir`/`siteCol`) is dead weight that also caused the only two plugin defects found (the exact-size
+  limited read and the past-the-bank site).
+- Drop when: n/a — dropped. Reopen only for a per-site concept (a different direction per layer on purpose,
+  not one concept sharpened), which needs no ABI field: the manifest's `pick` can carry a site map.
+
 ### D1 — per-layer steering bank for qwen4_exp (PR #538)
 - Level: L5          Status: dropped (2026-11-05) → tag `steering-bank-v1`, branches on `private`
 - Why dropped: owned an ABI bit, a route (`/v1/steering`) and a CLI; conflicted on every merge; upstream's
@@ -89,7 +125,7 @@ count is F1's 2 lines.
 ## Planned (not implemented; call out before starting, §4)
 - **CR-D** — env-gated capture tap in qwen4_exp (`QWEN4_TAP_DIR`, <100 lines, one plugin folder), sushi's
   shape. L5, upstream-worthy.
-- **CR-E** — ablation strength above 1 (reflection). Two-line parse change; only with numbers. L4.
+- **CR-E** — DONE as `fork/cr-e-strength` (merged 2026-11-08): see the entry below.
 - **Native DeepSeek ablation** in `deepseek_v41` — only if Pruned192 beats Sushi on quality (roadmap step 4).
   L5, CR-A-sized.
 - **Plugin side (CommunityServe/plugins, not this repo):** `expert_pick_tolerance` as a sushi_ds41 model
@@ -102,3 +138,10 @@ count is F1's 2 lines.
   2026-11-06. Details in `local/notes/roadmap-2026-11-06.md` step 1. Pinned in `local/plugins.conf` at
   `00f9bec` (2026-11-07; the delta from `59473a90` is `plugin.json` title/homepage/icon metadata and an
   `icon.png`, no code). Installed by `local/build.sh plugins` 2026-11-07, sha256 `4804d9cd…`.
+- `sushi_ds41` @ CommunityServe/plugins `e4787bc` (2026-11-08): per-layer ablation bank. The forward's
+  ablation now carries the profile's directory name (a new `name` field on the fork's `abi.Ablation`,
+  threaded host→engine→plugin), so the plugin loads that profile's per-layer `bank.f32` (one direction per
+  capture site) instead of projecting one shared direction at every site; a profile with no bank file falls
+  back to the shared direction broadcast to all sites, so the same plugin serves both arms. Banks are keyed
+  by name, loaded once, cached on the model, freed in `Model.deinit`. Plugin files: `ablation.zig`,
+  `ablation_test.zig`, `sushi/dsv41/dsv41_model.zig`. Depends on the fork's ABI `name` field (below).
