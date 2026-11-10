@@ -101,6 +101,17 @@ count is F1's 2 lines.
 - Upstream: yes, and it is the best single candidate (2 lines of behaviour, with numbers).
 - Drop when: upstream's `Ablation` range changes on its own.
 
+### Thinking on vs off (measurement, not a code change)
+- 2026-11-09, Sushi-STQ-1.75bpw, harmful_held 99: **refusals with thinking on are 3/99 (0.030) unablated**,
+  against 97/99 with thinking off. The model argues the refusal out of itself when it thinks, so there is almost
+  nothing left for an ablation to remove, and the thinking-off direction does not transfer: at strength 4 it
+  scored 5/99 (3 of them the same prompts), i.e. noise, with two prompts newly refused.
+- Consequence: a thinking-ON profile is NOT needed. It would have to be fitted against a 3-prompt residual,
+  which cannot beat not steering at all. One profile (thinking off, layer 37, strength 4) is what the model
+  setting names; a thinking request runs the same profile and the ablation is inert over an already-low rate.
+- If steering a thinking request ever matters, fit it on the residual (3 prompts here), never reuse a
+  thinking-off direction — the earlier 14/15 reading was the same non-transfer, not a mode artifact.
+
 ### CR-F — `abi.Ablation.name` (the profile's directory name, so a plugin can load a per-layer bank)
 - Level: L5          Status: **DROPPED, not built** (2026-11-08)
 - Why it was proposed: an outside plugin (`sushi_ds41`) wanted to load a per-layer `bank.f32` by profile name;
