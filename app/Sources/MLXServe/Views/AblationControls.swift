@@ -7,7 +7,7 @@ struct AblationMenuBarControl: View {
     /// The model's `model-settings.json` key; nil when the app does not know the resident model's folder.
     let modelPath: String?
     let modelId: String
-    let profiles: [String]
+    let profiles: [AblationProfile]
     let status: AblationStatus?
     @State private var setting: AblationSetting?
     @State private var failure: String?
@@ -68,7 +68,7 @@ struct AblationMenuBarControl: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
             .help(c.profile)
-            AblationStrengthField(strength: c.strength) { write(c.withStrength($0)) }
+            AblationStrengthField(strength: c.strength, maxStrength: c.maxStrength) { write(c.withStrength($0)) }
                 .textFieldStyle(.plain)
                 .font(.app(.caption2).monospaced())
                 .frame(width: 32)
@@ -102,7 +102,7 @@ struct AblationMenuBarControl: View {
 /// Model Settings' Ablation rows. Edits stay in the sheet until Save, which keeps the per-request plan (no reload).
 struct AblationSection: View {
     @Binding var setting: AblationSetting?
-    let profiles: [String]
+    let profiles: [AblationProfile]
     let status: AblationStatus?
     let modelId: String
 
@@ -115,7 +115,7 @@ struct AblationSection: View {
             }
             LabeledContent("Strength") {
                 // The sheet saves as a whole, so a typed value lands without Return.
-                AblationStrengthField(strength: c.strength, commitsWhileTyping: true) { setting = c.withStrength($0) }
+                AblationStrengthField(strength: c.strength, maxStrength: c.maxStrength, commitsWhileTyping: true) { setting = c.withStrength($0) }
                     .textFieldStyle(.roundedBorder)
                     .font(.app(.body).monospacedDigit())
                     .frame(width: 60)
@@ -134,6 +134,8 @@ struct AblationSection: View {
 /// Return or when the box loses focus, since every commit writes the file.
 struct AblationStrengthField: View {
     let strength: Double
+    /// The profile's measured ceiling (`AblationProfile.maxStrength`), which the server enforces too.
+    var maxStrength: Double = AblationControl.maxStrength
     var commitsWhileTyping = false
     let commit: (Double) -> Void
     @State private var text = ""
@@ -143,19 +145,19 @@ struct AblationStrengthField: View {
         TextField("", text: $text)
             .multilineTextAlignment(.trailing)
             .focused($focused)
-            .foregroundStyle(AblationControl.parseStrength(text) == nil ? Color.red : Color.primary)
+            .foregroundStyle(AblationControl.parseStrength(text, max: maxStrength) == nil ? Color.red : Color.primary)
             .onSubmit(send)
             .onChange(of: text) { _, _ in if commitsWhileTyping { send() } }
             .onChange(of: focused) { _, isFocused in
                 guard !isFocused else { return }
-                if AblationControl.parseStrength(text) == nil { text = AblationControl.format(strength) } else { send() }
+                if AblationControl.parseStrength(text, max: maxStrength) == nil { text = AblationControl.format(strength) } else { send() }
             }
             .onChange(of: strength) { _, value in if !focused { text = AblationControl.format(value) } }
             .onAppear { text = AblationControl.format(strength) }
-            .help("Strength from 0 to 1; 0 is off")
+            .help("Strength from 0 to \(AblationControl.format(maxStrength)); 0 is off. The profile's manifest bounds it.")
     }
 
     private func send() {
-        if let value = AblationControl.parseStrength(text), value != strength { commit(value) }
+        if let value = AblationControl.parseStrength(text, max: maxStrength), value != strength { commit(value) }
     }
 }

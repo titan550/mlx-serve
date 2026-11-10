@@ -243,7 +243,7 @@ class APIClient {
             agentBudget: AgentBudget.parse(first["agent_budget"]),
             modality: first["modality"] as? String,
             engines: first["engines"] as? [String] ?? [],
-            ablationProfiles: first["ablation_profiles"] as? [String] ?? []
+            ablationProfiles: (first["ablation_profiles"] as? [Any] ?? []).compactMap { AblationProfile(json: $0) }
         )
     }
 
