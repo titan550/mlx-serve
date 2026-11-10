@@ -20,7 +20,10 @@ pub const Ablation = struct {
     pub fn fromForward(f: *const abi.Forward) !?Ablation {
         const a = f.ablation orelse return null;
         const st = a.strengths.slice();
-        if (a.directions.ctx == null or !anyNonzero(st)) return null;
+        if (st.len != f.slots.len) return error.AblationSlots;
+        var any = false;
+        for (st) |v| any = any or v != 0;
+        if (a.directions.ctx == null or !any) return null;
         const strengths = mlx.mlx_array_new_data(st.ptr, &[_]c_int{@intCast(st.len)}, 1, .float32);
         if (strengths.ctx == null) return error.OutOfMemory;
         return .{ .dirs = .{ .ctx = a.directions.ctx }, .strengths = strengths, .owns_dirs = false };
@@ -85,7 +88,7 @@ pub const Ablation = struct {
         var rows = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(rows);
         try mlx.check(mlx.mlx_reshape(&rows, x.*, &[_]c_int{ shape[0], -1, hidden }, 3, s));
-        const projected = try hc_decode2.ablateOut(s, rows, self.pending(1));
+        const projected = try hc_decode2.ablateOut(s, rows, self.dirs, self.strengths);
         defer _ = mlx.mlx_array_free(projected);
         var next = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(next);
@@ -94,11 +97,6 @@ pub const Ablation = struct {
         x.* = next;
     }
 };
-
-fn anyNonzero(st: []const f32) bool {
-    for (st) |v| if (v != 0) return true;
-    return false;
-}
 
 /// A cluster pair runs layers or expert halves this forward never sees: an ablated request is refused there.
 pub fn servesAcross(pipeline_peer: bool, tensor_peer: bool) bool {

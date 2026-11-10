@@ -469,7 +469,6 @@ test "qwen4_exp served: an ablated slot's streams keep no component along its di
         }
     }
     // bf16 rounding leaves a few thousandths; a write that skips the projection leaves tenths.
-    std.debug.print("qwen4 ablation: worst |cos| with the ablated direction {d:.5}\n", .{worst});
     try testing.expect(worst <= 0.02);
 }
 

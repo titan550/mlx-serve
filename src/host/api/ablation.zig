@@ -205,21 +205,19 @@ pub fn parseProfile(a: std.mem.Allocator, name: []const u8, manifest: []const u8
     const bytes = tensor orelse return .{ .name = name, .refused = "direction.safetensors is missing" };
     var p: Profile = .{ .name = name };
     if (root.get("strength")) |v| {
-        if (v != .float and v != .integer) return .{ .name = name, .refused = "manifest strength is not a number" };
         p.strength = switch (v) {
             .float => |f| @floatCast(f),
             .integer => |i| @floatFromInt(i),
-            else => unreachable,
+            else => return .{ .name = name, .refused = "manifest strength is not a number" },
         };
         if (!(p.strength >= 0 and p.strength <= field_mod.max_strength))
             return .{ .name = name, .refused = "manifest strength is outside [0, 30]" };
     }
     if (root.get("max_strength")) |v| {
-        if (v != .float and v != .integer) return .{ .name = name, .refused = "manifest max_strength is not a number" };
         p.max_strength = switch (v) {
             .float => |f| @floatCast(f),
             .integer => |i| @floatFromInt(i),
-            else => unreachable,
+            else => return .{ .name = name, .refused = "manifest max_strength is not a number" },
         };
         if (!(p.max_strength >= p.strength and p.max_strength <= field_mod.max_strength))
             return .{ .name = name, .refused = "manifest max_strength is outside [strength, 30]" };
@@ -326,8 +324,6 @@ pub const Selected = struct {
 
 /// The prefix-cache sharing of a request that names none (`Prefix`).
 pub const default_prefix: Prefix = .isolated;
-
-
 
 fn bad(msg: []const u8) Outcome {
     return .{ .refused = .{ .status = "400 Bad Request", .code = 400, .msg = msg } };
@@ -436,11 +432,6 @@ pub fn forRequest(conn: *Conn, root: std.json.ObjectMap, lm: *LoadedModel) ?Refu
     return null;
 }
 
-/// A model setting the server cannot run fails every request on the model, by name (`/props` reports it first).
-fn unavailable(msg: []const u8) Refusal {
-    return .{ .status = "503 Service Unavailable", .code = 503, .msg = msg };
-}
-
 pub const SettingOutcome = union(enum) { none, selected: Selected, refused: []const u8 };
 
 /// `lm`'s own setting (`model-settings.json` `ablation`), read per request and checked like a request's selection but
@@ -482,7 +473,8 @@ pub fn forModelSetting(conn: *Conn, lm: *LoadedModel) ?Refusal {
         .none => return null,
         .refused => |m| {
             log.warn("[ablation] {s}\n", .{m});
-            return unavailable(m);
+            // A model setting the server cannot run fails every request on the model, by name.
+            return .{ .status = "503 Service Unavailable", .code = 503, .msg = m };
         },
         .selected => |sel| sel,
     };
@@ -518,23 +510,15 @@ fn propsFragment(a: std.mem.Allocator, entry: *const AblationSetting, outcome: S
     return std.fmt.allocPrint(a, ",\"ablation\":{s}", .{body});
 }
 
-/// The profiles that fit `lm`: loaded unrefused and made from its pack's exact `config.json`; a loaded model also
-/// needs the cap and the hidden size (a cold one is checked when a request selects one). Names borrow from the
-/// server's profile set.
-pub fn profilesFor(io: std.Io, lm: *LoadedModel, out: [][]const u8) [][]const u8 {
-    const s = if (http_server.g_ablation) |*g| g else return out[0..0];
-    if (lm.config) |c| if (!(if (c.plugin) |pb| pb.parsed.caps.ablation else false)) return out[0..0];
-    const sha = modelDigest(io, lm) orelse return out[0..0];
-    return fitting(s, sha, if (lm.config) |c| c.hidden_size else null, out);
-}
-
-fn fitting(s: *const Set, sha: [64]u8, hidden: ?u32, out: [][]const u8) [][]const u8 {
+/// The profiles that fit a pack: loaded unrefused, made from its exact `config.json`, and of its hidden size when
+/// known (a cold model is checked when a request selects one). Borrowed from the server's profile set.
+fn fitting(s: *const Set, sha: [64]u8, hidden: ?u32, out: []*const Profile) []*const Profile {
     var n: usize = 0;
     for (s.profiles) |*p| {
         if (n == out.len) break;
         if (p.refused != null or !std.mem.eql(u8, &p.config_sha256, &sha)) continue;
         if (hidden) |h| if (p.direction.len != h) continue;
-        out[n] = p.name;
+        out[n] = p;
         n += 1;
     }
     return out[0..n];
@@ -547,19 +531,13 @@ pub fn rowJson(a: std.mem.Allocator, io: std.Io, lm: *LoadedModel) ![]u8 {
     const s = if (http_server.g_ablation) |*g| g else return a.dupe(u8, "");
     if (lm.config) |c| if (!(if (c.plugin) |pb| pb.parsed.caps.ablation else false)) return a.dupe(u8, "");
     const sha = modelDigest(io, lm) orelse return a.dupe(u8, "");
-    const hidden = if (lm.config) |c| c.hidden_size else null;
+    var found: [64]*const Profile = undefined;
+    const fit = fitting(s, sha, if (lm.config) |c| c.hidden_size else null, &found);
+    if (fit.len == 0) return a.dupe(u8, "");
     const Row = struct { name: []const u8, strength: f32, max_strength: f32 };
     var rows: [64]Row = undefined;
-    var n: usize = 0;
-    for (s.profiles) |*p| {
-        if (n == rows.len) break;
-        if (p.refused != null or !std.mem.eql(u8, &p.config_sha256, &sha)) continue;
-        if (hidden) |h| if (p.direction.len != h) continue;
-        rows[n] = .{ .name = p.name, .strength = p.strength, .max_strength = p.max_strength };
-        n += 1;
-    }
-    if (n == 0) return a.dupe(u8, "");
-    const list = try std.json.Stringify.valueAlloc(a, rows[0..n], .{});
+    for (fit, rows[0..fit.len]) |p, *row| row.* = .{ .name = p.name, .strength = p.strength, .max_strength = p.max_strength };
+    const list = try std.json.Stringify.valueAlloc(a, rows[0..fit.len], .{});
     defer a.free(list);
     return std.fmt.allocPrint(a, ",\"ablation_profiles\":{s}", .{list});
 }
@@ -756,10 +734,10 @@ test "ablation profiles: a row lists the loaded profiles made from its pack's ex
     defer set.deinit();
     var sha: [64]u8 = undefined;
     @memcpy(&sha, sha_a);
-    var out: [4][]const u8 = undefined;
+    var out: [4]*const Profile = undefined;
     const loaded = fitting(&set, sha, 4, &out);
     try testing.expectEqual(@as(usize, 1), loaded.len);
-    try testing.expectEqualStrings("good", loaded[0]);
+    try testing.expectEqualStrings("good", loaded[0].name);
     try testing.expectEqual(@as(usize, 1), fitting(&set, sha, null, &out).len);
     try testing.expectEqual(@as(usize, 0), fitting(&set, sha, 8, &out).len);
     try testing.expectEqual(@as(usize, 0), fitting(&set, @splat('c'), 4, &out).len);

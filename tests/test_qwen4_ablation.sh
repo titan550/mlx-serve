@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_qwen4_ablation.sh — directional ablation on a Flash Next (qwen4_exp) pack, end to end (10 checks): a random
+# test_qwen4_ablation.sh — directional ablation on a Flash Next (qwen4_exp) pack, end to end: a random
 # direction as the only profile under --ablation-profiles, then strength 0 answers with the stock bytes, strength 1
 # changes the answer, both carry X-Ablation, a request without the key is a 401, the profile loaded, and the projection
 # rode the two-launch hyper-connection read. The pack's memory must be free (unload it from any other server first).
