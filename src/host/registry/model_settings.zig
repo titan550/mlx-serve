@@ -268,7 +268,7 @@ pub const AblationSetting = union(enum) {
     pub const Set = struct {
         name_buf: [128]u8 = undefined,
         name_len: usize = 0,
-        strength: f32 = 1,
+        strength: ?f32 = null,
         /// `isolated` (the default) or `shared`. A setting is the operator's call, so unlike a request it may choose:
         /// `shared` lets a steered turn reuse the conversation's cache and lets a later request restore its state.
         prefix: ?ablation_field.Prefix = null,

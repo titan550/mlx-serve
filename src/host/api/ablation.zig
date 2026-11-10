@@ -26,6 +26,13 @@ pub const Profile = struct {
     /// Lowercase hex sha256 of the exact `config.json` bytes of the pack the profile was computed on (the field name LoRA
     /// overlays use for the same binding).
     config_sha256: [64]u8 = @splat('0'),
+    /// The strength this profile was measured at: what a request or setting that names none runs. 1 when the manifest
+    /// says nothing, so an upstream profile keeps upstream's behaviour.
+    strength: f32 = 1,
+    /// The strongest strength measured safe for this profile's model. A request above it is refused by name: on a
+    /// hyper-connection arch (qwen4_exp) a projection past 1 reflects components in every stream and the output turns
+    /// to noise, while a single-direction arch (deepseek) takes 4 without damage. 30 (the global cap) when unstated.
+    max_strength: f32 = field_mod.max_strength,
     /// Content hash of the manifest and tensor bytes.
     hash: u64 = 0,
     /// Why the profile was refused at load; null = usable.
@@ -197,6 +204,26 @@ pub fn parseProfile(a: std.mem.Allocator, name: []const u8, manifest: []const u8
         return .{ .name = name, .refused = "base_config_sha256 is missing or not 64 hex digits" };
     const bytes = tensor orelse return .{ .name = name, .refused = "direction.safetensors is missing" };
     var p: Profile = .{ .name = name };
+    if (root.get("strength")) |v| {
+        if (v != .float and v != .integer) return .{ .name = name, .refused = "manifest strength is not a number" };
+        p.strength = switch (v) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => unreachable,
+        };
+        if (!(p.strength >= 0 and p.strength <= field_mod.max_strength))
+            return .{ .name = name, .refused = "manifest strength is outside [0, 30]" };
+    }
+    if (root.get("max_strength")) |v| {
+        if (v != .float and v != .integer) return .{ .name = name, .refused = "manifest max_strength is not a number" };
+        p.max_strength = switch (v) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => unreachable,
+        };
+        if (!(p.max_strength >= p.strength and p.max_strength <= field_mod.max_strength))
+            return .{ .name = name, .refused = "manifest max_strength is outside [strength, 30]" };
+    }
     for (&p.config_sha256, sha.string) |*o, c| o.* = std.ascii.toLower(c);
     p.direction = readDirection(a, bytes, @intCast(hidden.integer)) catch |e| return .{ .name = name, .refused = switch (e) {
         error.ZeroDirection => "the direction is zero",
@@ -325,12 +352,12 @@ pub fn resolve(set: ?*const Set, v: std.json.Value, presented_key: ?[]const u8, 
     }
     const name_v = v.object.get("profile") orelse return bad("ablation.profile is required");
     if (name_v != .string) return bad("ablation.profile must be a string");
-    const strength: f32 = if (v.object.get("strength")) |sv| switch (sv) {
+    const strength: ?f32 = if (v.object.get("strength")) |sv| switch (sv) {
         .float => |f| @floatCast(f),
-        .integer => |i| if (i >= 0 and i <= field_mod.max_strength) @floatFromInt(i) else -1,
+        .integer => |i| @floatFromInt(i),
         else => return bad("ablation.strength must be a number in [0, 30]"),
-    } else 1.0;
-    if (!(strength >= 0 and strength <= field_mod.max_strength)) return bad("ablation.strength must be a number in [0, 30]");
+    } else null;
+    if (strength) |st| if (!(st >= 0 and st <= field_mod.max_strength)) return bad("ablation.strength must be a number in [0, 30]");
     return select(s, .{ .profile = name_v.string, .strength = strength }, served, msg_buf);
 }
 
@@ -342,8 +369,11 @@ fn select(s: *const Set, f: field_mod.Field, served: Served, msg_buf: []u8) Outc
     if (p.direction.len != served.hidden) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (hidden size {d}, the model's is {d})", .{ p.name, p.direction.len, served.hidden }) catch "ablation profile is for another model");
     const sha = served.config_sha256 orelse return bad("ablation: the model's config.json could not be read to check the profile");
     if (!std.mem.eql(u8, &sha, &p.config_sha256)) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (config.json digest differs)", .{p.name}) catch "ablation profile is for another model");
+    // No strength asked for = the profile's own (the one it was measured at).
+    const strength = f.strength orelse p.strength;
+    if (strength > p.max_strength) return bad(std.fmt.bufPrint(msg_buf, "ablation strength {d:.3} is past the measured range of profile '{s}' (max {d:.3})", .{ strength, p.name, p.max_strength }) catch "ablation strength is past the profile's measured range");
     // A request's Field carries no prefix, so it lands on the default; a setting's does.
-    return .{ .selected = .{ .profile = p, .strength = f.strength, .prefix = f.prefix orelse default_prefix } };
+    return .{ .selected = .{ .profile = p, .strength = strength, .prefix = f.prefix orelse default_prefix } };
 }
 
 fn clip(s: []const u8) []const u8 {
@@ -471,9 +501,10 @@ pub fn propsJson(a: std.mem.Allocator, io: std.Io, lm: *LoadedModel) ![]u8 {
 }
 
 fn propsFragment(a: std.mem.Allocator, entry: *const AblationSetting, outcome: SettingOutcome) ![]u8 {
-    const Setting = struct { profile: []const u8, strength: f32, prefix_cache: []const u8 };
+    const Setting = struct { profile: []const u8, strength: ?f32, prefix_cache: []const u8 };
     const view: struct { setting: ?Setting, @"error": ?[]const u8 } = .{
         .setting = switch (entry.*) {
+            // Null strength = the profile's own default, which the profile list reports beside its name.
             .set => |*v| .{ .profile = v.field().profile, .strength = v.strength, .prefix_cache = @tagName(v.prefix orelse default_prefix) },
             else => null,
         },
@@ -509,12 +540,26 @@ fn fitting(s: *const Set, sha: [64]u8, hidden: ?u32, out: [][]const u8) [][]cons
     return out[0..n];
 }
 
-/// The `/v1/models` row fragment (`,"ablation_profiles":[...]`), empty when no profile fits.
+/// The `/v1/models` row fragment (`,"ablation_profiles":[{"name","strength","max_strength"}]`), empty when no profile
+/// fits. Each entry carries the strength the profile was measured at and the range it was measured safe in, so the app
+/// can seed its strength field and bound it without knowing any architecture.
 pub fn rowJson(a: std.mem.Allocator, io: std.Io, lm: *LoadedModel) ![]u8 {
-    var names: [64][]const u8 = undefined;
-    const fit = profilesFor(io, lm, &names);
-    if (fit.len == 0) return a.dupe(u8, "");
-    const list = try std.json.Stringify.valueAlloc(a, fit, .{});
+    const s = if (http_server.g_ablation) |*g| g else return a.dupe(u8, "");
+    if (lm.config) |c| if (!(if (c.plugin) |pb| pb.parsed.caps.ablation else false)) return a.dupe(u8, "");
+    const sha = modelDigest(io, lm) orelse return a.dupe(u8, "");
+    const hidden = if (lm.config) |c| c.hidden_size else null;
+    const Row = struct { name: []const u8, strength: f32, max_strength: f32 };
+    var rows: [64]Row = undefined;
+    var n: usize = 0;
+    for (s.profiles) |*p| {
+        if (n == rows.len) break;
+        if (p.refused != null or !std.mem.eql(u8, &p.config_sha256, &sha)) continue;
+        if (hidden) |h| if (p.direction.len != h) continue;
+        rows[n] = .{ .name = p.name, .strength = p.strength, .max_strength = p.max_strength };
+        n += 1;
+    }
+    if (n == 0) return a.dupe(u8, "");
+    const list = try std.json.Stringify.valueAlloc(a, rows[0..n], .{});
     defer a.free(list);
     return std.fmt.allocPrint(a, ",\"ablation_profiles\":{s}", .{list});
 }
