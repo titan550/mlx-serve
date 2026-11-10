@@ -30,25 +30,28 @@ strength or field, a model whose plugin lacks `Caps.ablation`, or the field sent
 the Ollama routes or a proxied `<id>@<provider>` / `<id>@<peer>` model. Other endpoints ignore it. The key is
 compared with surrounding whitespace trimmed; browsers may send `X-Ablation-Key` and read `X-Ablation` cross-origin.
 
-A request's ablation always runs `isolated`: it restores and commits nothing beside the unablated requests. Sharing is
-the server operator's call, not a request's — `prefix_cache` is a model setting (below), because a request that shares
-would commit KV computed under the ablation for other requests to restore. A request naming `prefix_cache` is a named
-400. A model that keeps its own state (DeepSeek-V4.1) keys its cache by the ablation either way.
+A request's ablation always runs `isolated`: it restores and commits nothing beside the unablated requests. Sharing
+is the server operator's call, not a request's — `prefix_cache` is a model setting (below), because a request that
+shares would commit KV computed under the ablation for other requests to restore. A request naming `prefix_cache`
+is a named 400. A model that keeps its own state (DeepSeek-V4.1) keys its cache by the ablation either way.
 
-A model's entry in `~/.mlx-serve/model-settings.json` may carry the same object, `"ablation": {"profile", "strength",
-"prefix_cache"}`, read per request: every request to that model that names no `ablation` runs under it, on every
-text surface (`/v1/messages`, `/v1/responses` and the Ollama routes included), with no key (the server's own file),
-and its `prefix_cache` is `"isolated"` (the default) or `"shared"`: shared restores and commits the one prompt cache,
-so an ablated turn in the middle of a long session reuses its conversation instead of re-prefilling it, and a later
-request may restore state computed under the ablation. Strength 0 keeps the profile but runs standard. A setting the server cannot
-run (no `--ablation-profiles`, an unknown or mismatched profile, a model without `Caps.ablation`) fails each request
-on that model with a 503 naming why. `/props?model=<id>` reports `"ablation": {"setting", "error"}`, and each
-`/v1/models` row lists the profiles made from its pack in `ablation_profiles`.
+A model's entry in `~/.mlx-serve/model-settings.json` may carry the same object, `"ablation": {"profile",
+"strength", "prefix_cache"}`, read per request: every request to that model that names no `ablation` runs under it,
+on every text surface (`/v1/messages`, `/v1/responses` and the Ollama routes included), with no key (the server's
+own file). Its `prefix_cache` is `"isolated"` (the default) or `"shared"`: shared restores and commits the one
+prompt cache, so an ablated turn in the middle of a long session reuses its conversation instead of re-prefilling
+it, and a later request may restore state computed under the ablation. Strength 0 keeps the profile but runs
+standard. A setting the server cannot run (no `--ablation-profiles`, an unknown or mismatched profile, a model
+without `Caps.ablation`) fails each request on that model with a 503 naming why. `/props?model=<id>` reports
+`"ablation": {"setting", "error"}`, and each `/v1/models` row lists the profiles made from its pack in
+`ablation_profiles`, as objects `{"name", "strength", "max_strength"}`.
 
 A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"version": 1`, `hidden_size`,
-`base_config_sha256`: sha256 of the base pack's exact `config.json` bytes) and `direction.safetensors` (one tensor
-`direction`, `[hidden]`, F32/F16/BF16, normalized at load). Make the key with
-`openssl rand -hex 32 > key && chmod 600 key` and serve only over TLS or loopback: the header is a bearer secret.
+`base_config_sha256`: sha256 of the base pack's exact `config.json` bytes, and optionally `strength`: the strength
+the profile was measured at, run when a request or setting names none, and `max_strength`: the strongest measured
+safe for that model, a named 400 past it) and `direction.safetensors` (one tensor `direction`, `[hidden]`,
+F32/F16/BF16, normalized at load). Make the key with `openssl rand -hex 32 > key && chmod 600 key` and serve only
+over TLS or loopback: the header is a bearer secret.
 
 ## POST /v1/messages (Anthropic)
 

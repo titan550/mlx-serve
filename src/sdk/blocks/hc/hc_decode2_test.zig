@@ -347,7 +347,7 @@ test "hc decode2: ablateOut removes each row's component along its slot's direct
     }
     const sa = mlx.mlx_array_new_data(&strengths, &[_]c_int{strengths.len}, 1, .float32);
     defer _ = mlx.mlx_array_free(sa);
-    const got = try hc_decode2.ablateOut(s, wo, .{ .dirs = dirs.arr, .strengths = sa, .per = @intCast(per) });
+    const got = try hc_decode2.ablateOut(s, wo, dirs.arr, sa);
     defer _ = mlx.mlx_array_free(got);
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got));
     try testing.expectEqualSlices(c_int, mlx.getShape(wo), mlx.getShape(got));

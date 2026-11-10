@@ -10,6 +10,7 @@ pub const Request = struct {
     strength: f32,
     /// The profile's content hash with the strength folded in (`abi.Ablation.key`).
     key: u64,
+    /// How this request shares the prefix cache with unablated ones (`Prefix`).
     prefix: Prefix = .isolated,
 };
 
@@ -23,15 +24,14 @@ pub const Prefix = enum { isolated, shared };
 /// measurement and keeps a typo from clearing the whole stream.
 pub const max_strength: f32 = 30;
 
-/// A model setting's `ablation` object (`~/.mlx-serve/model-settings.json`), which adds `prefix` to what a request
-/// names; a request's own field is parsed in `host/api/ablation.zig`, upstream's shape. `profile` borrows from the JSON.
 /// A profile and the strength asked for it; null strength = the profile's own default (its manifest's `strength`).
+/// A model setting also names `prefix`, which a request may not.
 pub const Field = struct { profile: []const u8, strength: ?f32 = null, prefix: ?Prefix = null };
 
 pub const Parsed = union(enum) { ok: Field, bad: []const u8 };
 
-/// A model setting's `ablation` object (a request's own field is parsed by `host/api/ablation.zig`, upstream's shape):
-/// `profile`, `strength`, and `prefix_cache`, which is a setting's to choose.
+/// A model setting's `ablation` object: `profile`, `strength`, and `prefix_cache`, which is a setting's to choose.
+/// A request's own field is parsed in `host/api/ablation.zig` and names neither.
 pub fn parseSetting(v: std.json.Value, msg_buf: []u8) Parsed {
     if (v != .object) return .{ .bad = "ablation must be an object {\"profile\": string, \"strength\": number}" };
     var it = v.object.iterator();
