@@ -160,8 +160,9 @@ count is F1's 2 lines.
   `~/claude-tmp/ablation-scratch/bank_to_profiles.py`.
 
 ### Stale — `fix/qsa-select-tiny-array`, `fix/tiny-qwen4-fixture-guards`
-- Status: parked. Pre-rewrite (#978) fixes; the QSA block select change is not on `origin/main` in any form.
-  Re-check whether the defect exists on the current tree before the next release adoption; delete if not.
+- Status: **deleted 2026-11-09**. Pre-rewrite (#978) fixes; the rewritten tree already declines the defect
+  (`contract_qsa_attn.zig`: `shape.rows * shape.k < 8` returns null, and the block lists bind as one array under
+  8 elements), so the patches are obsolete and their branches were based on an ancient tree.
 
 ## Planned (not implemented; call out before starting, §4)
 - **CR-D** — env-gated capture tap in qwen4_exp (`QWEN4_TAP_DIR`, <100 lines, one plugin folder), sushi's
