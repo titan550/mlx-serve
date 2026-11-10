@@ -316,17 +316,24 @@ pub fn resolve(set: ?*const Set, v: std.json.Value, presented_key: ?[]const u8, 
     const s = set orelse return bad("ablation is not enabled on this server");
     const key = presented_key orelse return unauthorized("ablation key missing (X-Ablation-Key header)");
     if (!s.keyMatches(key)) return unauthorized("ablation key rejected");
-    const f = switch (field_mod.parseField(v, msg_buf)) {
-        .ok => |f| f,
-        .bad => |m| return bad(m),
-    };
-    // Nothing a request could ask for here differs from the default: `isolated` is what a request gets, and `shared`
-    // is the model's setting (the operator's call, since it lets one request's KV serve another).
-    if (f.prefix != null) return bad("ablation.prefix_cache is the model's setting; a request may not name it");
-    return select(s, f, served, msg_buf);
+    // Upstream's parse, in place: a request names `profile` and `strength`, and nothing else.
+    if (v != .object) return bad("ablation must be an object {\"profile\": string, \"strength\": number}");
+    var it = v.object.iterator();
+    while (it.next()) |kv| {
+        if (!std.mem.eql(u8, kv.key_ptr.*, "profile") and !std.mem.eql(u8, kv.key_ptr.*, "strength"))
+            return bad(std.fmt.bufPrint(msg_buf, "unknown field 'ablation.{s}'", .{clip(kv.key_ptr.*)}) catch "unknown field in ablation");
+    }
+    const name_v = v.object.get("profile") orelse return bad("ablation.profile is required");
+    if (name_v != .string) return bad("ablation.profile must be a string");
+    const strength: f32 = if (v.object.get("strength")) |sv| switch (sv) {
+        .float => |f| @floatCast(f),
+        .integer => |i| if (i >= 0 and i <= field_mod.max_strength) @floatFromInt(i) else -1,
+        else => return bad("ablation.strength must be a number in [0, 30]"),
+    } else 1.0;
+    if (!(strength >= 0 and strength <= field_mod.max_strength)) return bad("ablation.strength must be a number in [0, 30]");
+    return select(s, .{ .profile = name_v.string, .strength = strength }, served, msg_buf);
 }
 
-/// The checks every selection passes once its source vouched for it (a request's key, the server's own settings).
 fn select(s: *const Set, f: field_mod.Field, served: Served, msg_buf: []u8) Outcome {
     const name = f.profile;
     const p = s.find(name) orelse return bad(std.fmt.bufPrint(msg_buf, "unknown ablation profile '{s}'", .{clip(name)}) catch "unknown ablation profile");
@@ -335,6 +342,7 @@ fn select(s: *const Set, f: field_mod.Field, served: Served, msg_buf: []u8) Outc
     if (p.direction.len != served.hidden) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (hidden size {d}, the model's is {d})", .{ p.name, p.direction.len, served.hidden }) catch "ablation profile is for another model");
     const sha = served.config_sha256 orelse return bad("ablation: the model's config.json could not be read to check the profile");
     if (!std.mem.eql(u8, &sha, &p.config_sha256)) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (config.json digest differs)", .{p.name}) catch "ablation profile is for another model");
+    // A request's Field carries no prefix, so it lands on the default; a setting's does.
     return .{ .selected = .{ .profile = p, .strength = f.strength, .prefix = f.prefix orelse default_prefix } };
 }
 
@@ -631,10 +639,8 @@ test "ablation request: every refusal row of the failure matrix, and the key nev
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = .{ .hidden = 4, .serves = false, .config_sha256 = sha }, .code = 400, .says = "does not serve" },
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = .{ .hidden = 8, .serves = true, .config_sha256 = sha }, .code = 400, .says = "hidden size" },
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = other, .code = 400, .says = "digest differs" },
-        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"shared\"}", .key = test_key, .served = served, .code = 400, .says = "the model's setting" },
-        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"isolated\"}", .key = test_key, .served = served, .code = 400, .says = "the model's setting" },
-        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"warm\"}", .key = test_key, .served = served, .code = 400, .says = "prefix_cache must be" },
-        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":1}", .key = test_key, .served = served, .code = 400, .says = "prefix_cache must be" },
+        // Upstream's shape: a request names profile and strength, so the cache mode is an unknown field there.
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"shared\"}", .key = test_key, .served = served, .code = 400, .says = "unknown field 'ablation.prefix_cache'" },
     };
     for (cases) |c| {
         const o = resolve(c.set, try json(a, c.field), c.key, c.served, &buf);
