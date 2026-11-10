@@ -269,6 +269,8 @@ pub const AblationSetting = union(enum) {
         name_buf: [128]u8 = undefined,
         name_len: usize = 0,
         strength: f32 = 1,
+        /// `isolated` (the default) or `shared`. A setting is the operator's call, so unlike a request it may choose:
+        /// `shared` lets a steered turn reuse the conversation's cache and lets a later request restore its state.
         prefix: ?ablation_field.Prefix = null,
 
         pub fn field(self: *const Set) ablation_field.Field {
@@ -285,9 +287,12 @@ pub const AblationSetting = union(enum) {
         }
     };
 
+    /// A setting's `ablation` object: what a request names (`profile`, `strength`) plus `prefix_cache`, which only a
+    /// setting may choose — `shared` lets a steered turn reuse the conversation's cache and lets a later request
+    /// restore state computed under the ablation.
     pub fn fromJson(v: std.json.Value) AblationSetting {
         var tmp: [96]u8 = undefined;
-        const why: []const u8 = switch (ablation_field.parseField(v, &tmp)) {
+        const why: []const u8 = switch (ablation_field.parseSetting(v, &tmp)) {
             .ok => |f| if (f.profile.len <= (Set{}).name_buf.len) {
                 var set: Set = .{ .strength = f.strength, .prefix = f.prefix, .name_len = f.profile.len };
                 @memcpy(set.name_buf[0..f.profile.len], f.profile);
@@ -295,6 +300,10 @@ pub const AblationSetting = union(enum) {
             } else "ablation.profile is too long",
             .bad => |m| m,
         };
+        return malformedOf(why);
+    }
+
+    fn malformedOf(why: []const u8) AblationSetting {
         var msg: Msg = .{};
         msg.len = @min(why.len, msg.buf.len);
         @memcpy(msg.buf[0..msg.len], why[0..msg.len]);
