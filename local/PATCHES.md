@@ -101,6 +101,29 @@ count is F1's 2 lines.
 - Upstream: yes, and it is the best single candidate (2 lines of behaviour, with numbers).
 - Drop when: upstream's `Ablation` range changes on its own.
 
+### CR-G — a profile declares its strength and its measured ceiling
+- Level: L4/L5          Status: active, merged 2026-11-09
+- Why: the safe strength is a property of the PROFILE, not of the caller. Measured on Qwen3.8-Flash-Next
+  (qwen4_exp, hyper-connections): strength 1 is byte-identical to no ablation on 6/8 benign prompts; strength 3
+  emits `'ioioioio…'` and empty answers, strength 4 one-word garbage — the projection reflects components in all
+  four hc streams and compounds over 48 layers. On Sushi (single-direction, 5120-wide) strength 4 clears 96% of
+  refusals with no benign damage. One global cap cannot serve both, and a caller cannot know which is which.
+- Shape: `manifest.json` gains optional `strength` (the strength the profile was measured at: what a request or
+  setting that names none runs) and optional `max_strength` (the strongest measured safe; default = the global
+  30). Resolution: request > model setting > profile default. Above the profile's ceiling is a named 400.
+- Surfaces: `/v1/models` `ablation_profiles` becomes objects `{name, strength, max_strength}` so the app seeds
+  its strength field from the profile and bounds it; `/props` reports the setting's strength as written (null =
+  the profile's default).
+- Files touched: `src/host/api/ablation.zig` (Profile, parseProfile, select, rowJson, propsFragment),
+  `src/sdk/request/ablation.zig` (optional `Field.strength`), `src/host/registry/model_settings.zig` (optional
+  setting strength), app `Models/Ablation.swift` + `Views/AblationControls.swift` + `APIClient` + `ChatModels`,
+  `tests/test_ablation_model_setting.sh`, `docs/api.md`. Upstream-file lines: ~90.
+- Off switch: a manifest without `strength`/`max_strength` behaves exactly as before (default 1, ceiling 30).
+- Tests: ablation 76/76, model_settings 80/80, `test_ablation_model_setting.sh` 11/11, app
+  `AblationControlTests` 11/11 + `AblationServerReportTests` 3/3.
+- Upstream: plausible as "a profile carries the strength it was measured at"; it also makes CR-E safer.
+- Drop when: upstream's manifest gains a strength field of its own.
+
 ### Thinking on vs off (measurement, not a code change)
 - 2026-11-09, Sushi-STQ-1.75bpw, harmful_held 99: **refusals with thinking on are 3/99 (0.030) unablated**,
   against 97/99 with thinking off. The model argues the refusal out of itself when it thinks, so there is almost
