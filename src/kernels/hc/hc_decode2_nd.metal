@@ -56,11 +56,31 @@ for (int i = 0; i < PER; ++i) wv[i] = float(nw[base + int(t) + 256 * i]);
 float xv[PER];
 T written[PER];
 if (WR) {
-  // Pending hcWrite: stream' = T(stream + T(out * inj)), the chain's two roundings.
+  // Pending hcWrite: stream' = T(stream + T(out * inj)), the chain's two roundings. With AB, `out` first loses its slot's
+  // strength times its component along the slot's direction, in f32 with one rounding (`ablateOut`); the dot is summed
+  // as the norm's square sum is (a lane's products, simd_sum, the eight simdgroups' partials).
   const float gate = float(wi_in[row * HC + s]);
+  const size_t dbase = (size_t)(row / SEQ) * H;
+  float cs = 0.0f;
+  if (AB) {
+    float dp = 0.0f;
+    for (int i = 0; i < PER; ++i) {
+      const int k = int(t) + 256 * i;
+      dp += float(wo_in[(size_t)row * H + k]) * float(ad_in[dbase + k]);
+    }
+    dp = simd_sum(dp);
+    if (lane == 0) npart[sg] = dp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float dot = 0.0f;
+    for (int q = 0; q < 8; ++q) dot += npart[q];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    cs = dot * float(as_in[row / SEQ]);
+  }
   for (int i = 0; i < PER; ++i) {
     const int k = int(t) + 256 * i;
-    const T v = T(float(x_in[xrow + base + k]) + float(T(float(wo_in[(size_t)row * H + k]) * gate)));
+    const float o = float(wo_in[(size_t)row * H + k]);
+    const float oa = AB ? float(T(o - cs * float(ad_in[dbase + k]))) : o;
+    const T v = T(float(x_in[xrow + base + k]) + float(T(oa * gate)));
     written[i] = v;
     xv[i] = float(v);
   }

@@ -176,3 +176,81 @@ test "hc decode2: a multi-row read matches each row read alone (4/5/6-bit, per-r
     try parityRows(512, 64, 4, 64, 0x2D0DE4, 3);
     for ([_]u32{ 5, 6 }) |bits| try parityRows(2560, 320, bits, 64, 0x2D0DE5 + bits, 5);
 }
+
+/// Unit-norm f32 directions, one row of `h` per slot, and the host copy.
+fn unitDirections(rnd: std.Random, slots: usize, h: usize) !struct { arr: mlx.mlx_array, host: []f32 } {
+    const buf = try testing.allocator.alloc(f32, slots * h);
+    errdefer testing.allocator.free(buf);
+    for (0..slots) |r| {
+        const row = buf[r * h ..][0..h];
+        var ss: f64 = 0;
+        for (row) |*v| {
+            v.* = rnd.float(f32) - 0.5;
+            ss += @as(f64, v.*) * v.*;
+        }
+        const inv: f32 = @floatCast(1 / @sqrt(ss));
+        for (row) |*v| v.* *= inv;
+    }
+    return .{ .arr = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ @intCast(slots), @intCast(h) }, 2, .float32), .host = buf };
+}
+
+/// `v` rounded to bf16, as the kernel's `T(...)` and the chain's final cast round.
+fn rtBf16(v: f64) f64 {
+    return @import("../../testing/kernel_contract/host.zig").rt(.bfloat16, v);
+}
+
+/// `wo` with each row's component along its slot's direction removed, `strengths[slot]` times, in float64 and rounded to
+/// bf16 once; `cs` gets each row's coefficient.
+fn ablatedRef(woh: []const f32, dh: []const f32, sh: []const f32, h: usize, per: usize, out: []f64, cs: []f64) void {
+    for (0..woh.len / h) |row| {
+        const slot = row / per;
+        var dot: f64 = 0;
+        for (0..h) |i| dot += @as(f64, woh[row * h + i]) * dh[slot * h + i];
+        cs[row] = dot * sh[slot];
+        for (0..h) |i| out[row * h + i] = rtBf16(woh[row * h + i] - cs[row] * dh[slot * h + i]);
+    }
+}
+
+/// One bf16 ulp of `want`, plus what the device's f32 coefficient can move a value by.
+fn withinUlp(want: f64, got: f64, cs: f64, d: f64) bool {
+    return @abs(want - got) <= 0x1p-7 * @abs(want) + 0x1p-7 * @abs(cs * d) + 1e-6;
+}
+
+test "hc decode2: ablateOut removes each row's component along its slot's direction, rounding once" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xAB1A90);
+    const rnd = prng.random();
+    const h: usize = 256;
+    const strengths = [_]f32{ 1.0, 0.0, 0.4 };
+    const per: usize = 2;
+    const rows = strengths.len * per;
+    const wo = try randBf16(rnd, &.{ @intCast(strengths.len), @intCast(per), @intCast(h) }, 2.0, 0.0, s);
+    defer _ = mlx.mlx_array_free(wo);
+    const dirs = try unitDirections(rnd, strengths.len, h);
+    defer {
+        _ = mlx.mlx_array_free(dirs.arr);
+        testing.allocator.free(dirs.host);
+    }
+    const sa = mlx.mlx_array_new_data(&strengths, &[_]c_int{strengths.len}, 1, .float32);
+    defer _ = mlx.mlx_array_free(sa);
+    const got = try hc_decode2.ablateOut(s, wo, .{ .dirs = dirs.arr, .strengths = sa, .per = @intCast(per) });
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got));
+    try testing.expectEqualSlices(c_int, mlx.getShape(wo), mlx.getShape(got));
+    const woh = try readF32(wo, s);
+    defer testing.allocator.free(woh);
+    const gh = try readF32(got, s);
+    defer testing.allocator.free(gh);
+    const want = try testing.allocator.alloc(f64, woh.len);
+    defer testing.allocator.free(want);
+    var cs: [rows]f64 = undefined;
+    ablatedRef(woh, dirs.host, &strengths, h, per, want, &cs);
+    for (0..rows) |row| {
+        const slot = row / per;
+        for (0..h) |i| {
+            const at = row * h + i;
+            if (strengths[slot] == 0) try testing.expectEqual(woh[at], gh[at]) else try testing.expect(withinUlp(want[at], gh[at], cs[row], dirs.host[slot * h + i]));
+        }
+    }
+}
