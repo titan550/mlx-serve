@@ -158,7 +158,10 @@ pub fn hcReadFusedFor(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, 
     const hp = @import("../../sdk/blocks/hc/hc_prefill.zig");
     if (hp.eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(stream))) {
         // The prefill norms have no ablation arm: they take the pending write's `out` projected.
-        const projected: ?mlx.mlx_array = if (pend) |p| (if (p.ablate) |ab| try hc_decode2.ablateOut(self.s, p.out, ab) else null) else null;
+        const projected: ?mlx.mlx_array = if (pend) |p| blk: {
+            const ab = p.ablate orelse break :blk null;
+            break :blk try hc_decode2.ablateOut(self.s, p.out, ab.dirs, ab.strengths);
+        } else null;
         defer if (projected) |o| {
             _ = mlx.mlx_array_free(o);
         };
@@ -208,7 +211,6 @@ pub fn hcReadVerifyRows(self: *Trunk, rows: anytype, w: *const HcWeights, group:
     var pending: [8]HcPending = undefined;
     for (rows, 0..) |row, i| {
         if (row.seq != width or (row.pending != null) != has_pending) return null;
-        if (row.pending) |p| if ((p.ablate != null) != (group != null)) return null;
         inputs[i] = row.h;
         if (row.pending) |p| pending[i] = p;
     }
@@ -270,7 +272,7 @@ pub fn hcFlush(self: *Trunk, h: *mlx.mlx_array, batch: c_int, seq_len: c_int, pe
 /// `hcWrite` with `out` ablated first when `ab` rides it. Consumes `stream`.
 pub fn hcWriteAblated(self: *Trunk, stream: mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, ab: ?hc_decode2.Ablate) !mlx.mlx_array {
     const a = ab orelse return self.hcWrite(stream, out, inj, batch, seq_len);
-    const projected = try hc_decode2.ablateOut(self.s, out, a);
+    const projected = try hc_decode2.ablateOut(self.s, out, a.dirs, a.strengths);
     defer _ = mlx.mlx_array_free(projected);
     return self.hcWrite(stream, projected, inj, batch, seq_len);
 }

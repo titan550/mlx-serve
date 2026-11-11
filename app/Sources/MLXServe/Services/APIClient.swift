@@ -243,7 +243,7 @@ class APIClient {
             agentBudget: AgentBudget.parse(first["agent_budget"]),
             modality: first["modality"] as? String,
             engines: first["engines"] as? [String] ?? [],
-            ablationProfiles: first["ablation_profiles"] as? [String] ?? []
+            ablationProfiles: (first["ablation_profiles"] as? [Any] ?? []).compactMap { AblationProfile(json: $0) }
         )
     }
 
@@ -440,7 +440,7 @@ class APIClient {
         /// Moves whenever `/v1/models` would read differently; nil from older servers.
         let registryGeneration: UInt64?
         /// Filed under the model the request named; nil for the bare route.
-        var ablation: AblationStatus? = nil
+        let ablation: AblationStatus?
     }
 
     /// `model` names the model the per-model parts describe; nil = the server's default.

@@ -96,8 +96,16 @@ final class AblationFilesTests: XCTestCase {
 /// the request named.
 final class AblationServerReportTests: XCTestCase {
     func testAModelRowListsItsProfiles() {
-        XCTAssertEqual(APIClient.parseModelInfo(["id": "org/m", "ablation_profiles": ["a", "b"]]).ablationProfiles, ["a", "b"])
+        let row = APIClient.parseModelInfo(["id": "org/m", "ablation_profiles": [
+            ["name": "a", "strength": 4, "max_strength": 4],
+            ["name": "b", "strength": 1, "max_strength": 1],
+        ]])
+        XCTAssertEqual(row.ablationProfiles.map(\.name), ["a", "b"])
+        XCTAssertEqual(row.ablationProfiles.map(\.strength), [4, 1])
+        XCTAssertEqual(row.ablationProfiles.map(\.maxStrength), [4, 1])
         XCTAssertEqual(APIClient.parseModelInfo(["id": "org/m"]).ablationProfiles, [])
+        // A row this app cannot read is dropped, never guessed at.
+        XCTAssertEqual(APIClient.parseModelInfo(["id": "org/m", "ablation_profiles": ["a"]]).ablationProfiles, [])
     }
 
     func testPropsAblationIsFiledUnderTheModelTheRequestNamed() throws {
@@ -125,7 +133,8 @@ final class AblationServerReportTests: XCTestCase {
 
 /// The Ablation controls' state (menu bar and Model Settings): what shows, and what each edit writes.
 final class AblationControlTests: XCTestCase {
-    private let profiles = ["alpha", "beta"]
+    private let profiles = [AblationProfile(name: "alpha", strength: 4, maxStrength: 4),
+                            AblationProfile(name: "beta", strength: 1, maxStrength: 1)]
 
     private func control(_ setting: AblationSetting?) -> AblationControl {
         AblationControl(profiles: profiles, setting: setting)
@@ -153,9 +162,10 @@ final class AblationControlTests: XCTestCase {
         let c = control(nil)
         XCTAssertFalse(c.isOn)
         XCTAssertEqual(c.profile, "alpha")
-        XCTAssertEqual(c.strength, 1)
+        XCTAssertEqual(c.strength, 4, "the profile's measured strength, not a guess")
+        XCTAssertEqual(c.maxStrength, 4)
         XCTAssertTrue(c.reusesPrefixCache)
-        XCTAssertEqual(c.turnedOn(true), AblationSetting(profile: "alpha", strength: 1, prefixCache: "shared"))
+        XCTAssertEqual(c.turnedOn(true), AblationSetting(profile: "alpha", strength: 4, prefixCache: "shared"))
     }
 
     func testOffIsStrengthZeroWithTheProfileKept() {
@@ -172,14 +182,15 @@ final class AblationControlTests: XCTestCase {
 
     func testEachEditChangesOnlyItsField() {
         let s = AblationSetting(profile: "alpha", strength: 0.4, prefixCache: "shared")
-        XCTAssertEqual(control(s).choosing("beta"), AblationSetting(profile: "beta", strength: 0.4, prefixCache: "shared"))
+        // Picking a profile while on seeds that profile's measured strength (beta was measured at 1).
+        XCTAssertEqual(control(s).choosing("beta"), AblationSetting(profile: "beta", strength: 1, prefixCache: "shared"))
         XCTAssertEqual(control(s).withStrength(0.75), AblationSetting(profile: "alpha", strength: 0.75, prefixCache: "shared"))
         XCTAssertEqual(control(s).reusingPrefixCache(false), AblationSetting(profile: "alpha", strength: 0.4, prefixCache: "isolated"))
         XCTAssertEqual(control(s).reusingPrefixCache(true).prefixCache, "shared")
         XCTAssertFalse(control(control(s).withStrength(0)).isOn, "strength 0 is off")
         XCTAssertEqual(control(nil).withStrength(0.3), AblationSetting(profile: "alpha", strength: 0.3, prefixCache: "shared"),
                        "typing a strength turns it on")
-        XCTAssertEqual(control(nil).choosing("beta").strength, 0, "picking a profile does not turn it on")
+        XCTAssertEqual(control(nil).choosing("beta").strength, 0, "picking a profile does not turn an off setting on")
     }
 
     /// No key runs isolated, the server's default; "shared" is the only value that reuses.
@@ -188,14 +199,14 @@ final class AblationControlTests: XCTestCase {
         XCTAssertFalse(control(AblationSetting(profile: "alpha", prefixCache: "isolated")).reusesPrefixCache)
         XCTAssertTrue(control(AblationSetting(profile: "alpha", prefixCache: "shared")).reusesPrefixCache)
         // The memberwise init takes any string; the JSON one is the path a stored setting comes in by.
-        XCTAssertNil(AblationSetting(json: ["profile": "alpha", "prefix_cache": "read"]), "the server no longer has that mode")
+        XCTAssertNil(AblationSetting(json: ["profile": "alpha", "prefix_cache": "read"]), "the server takes isolated or shared")
     }
 
     func testAStoredProfileTheServerNoLongerListsStaysAChoice() {
         let c = control(AblationSetting(profile: "gone"))
         XCTAssertEqual(c.choices, ["alpha", "beta", "gone"])
         XCTAssertEqual(c.profile, "gone")
-        XCTAssertEqual(control(AblationSetting(profile: "beta")).choices, profiles)
+        XCTAssertEqual(control(AblationSetting(profile: "beta")).choices, profiles.map(\.name))
     }
 
     /// A stored strength above 1 is one the server accepts: reading it must not drop the setting, and a save must

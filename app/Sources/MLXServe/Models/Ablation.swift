@@ -114,17 +114,43 @@ enum AblationFiles {
     }
 }
 
+/// A profile the server lists for a model: its directory name, the strength it was measured at (what a request or
+/// setting that names none runs), and the strongest strength measured safe for that model's architecture.
+struct AblationProfile: Equatable, Hashable {
+    let name: String
+    var strength: Double = 1
+    var maxStrength: Double = AblationControl.maxStrength
+
+    init(name: String, strength: Double = 1, maxStrength: Double = AblationControl.maxStrength) {
+        self.name = name
+        self.strength = strength
+        self.maxStrength = maxStrength
+    }
+
+    /// nil unless the row is a profile object this app can read.
+    init?(json: Any) {
+        guard let o = json as? [String: Any], let name = o["name"] as? String, !name.isEmpty else { return nil }
+        self.name = name
+        if let s = o["strength"] as? NSNumber, CFGetTypeID(s) != CFBooleanGetTypeID(), s.doubleValue >= 0 {
+            strength = s.doubleValue
+        }
+        if let m = o["max_strength"] as? NSNumber, CFGetTypeID(m) != CFBooleanGetTypeID(), m.doubleValue >= strength {
+            maxStrength = m.doubleValue
+        }
+    }
+}
+
 /// What the Ablation controls show and what each edit writes; the menu bar and Model Settings share it.
 struct AblationControl {
     /// The model row's `ablation_profiles`: the profiles that fit it, loaded when the server started.
-    let profiles: [String]
+    let profiles: [AblationProfile]
     /// The setting as the file holds it.
     let setting: AblationSetting?
     /// The server's sentence when the setting cannot run.
     let error: String?
 
     /// `status` counts only when it is about `modelId`.
-    init(profiles: [String], setting: AblationSetting?, status: AblationStatus? = nil, modelId: String? = nil) {
+    init(profiles: [AblationProfile], setting: AblationSetting?, status: AblationStatus? = nil, modelId: String? = nil) {
         self.profiles = profiles
         self.setting = setting
         error = status.flatMap { $0.modelId == modelId ? $0.error : nil }
@@ -134,19 +160,31 @@ struct AblationControl {
     /// The error shows even with no profile listed: every request on the model fails with it.
     var isVisible: Bool { showsControls || error != nil }
     var isOn: Bool { (setting?.strength ?? 0) > 0 }
-    var profile: String { setting?.profile ?? profiles.first ?? "" }
+    var profile: String { setting?.profile ?? profiles.first?.name ?? "" }
     /// A stored profile the server no longer lists stays a choice, so it shows and can be replaced.
     var choices: [String] {
-        guard let stored = setting?.profile, !profiles.contains(stored) else { return profiles }
-        return profiles + [stored]
+        let names = profiles.map(\.name)
+        guard let stored = setting?.profile, !names.contains(stored) else { return names }
+        return names + [stored]
     }
-    /// Off, the strength box shows what turning on writes.
-    var strength: Double { isOn ? setting?.strength ?? 1 : 1 }
+    /// The listed profile the controls describe: the stored one, else the first.
+    var listed: AblationProfile? {
+        profiles.first { $0.name == profile }
+    }
+    /// The strongest strength the server accepts for this profile: its measured ceiling, or the global cap when the
+    /// profile is one the server no longer lists.
+    var maxStrength: Double { listed?.maxStrength ?? Self.maxStrength }
+    /// Off, the strength box shows what turning on writes: the profile's own measured strength.
+    var strength: Double { isOn ? setting?.strength ?? listed?.strength ?? 1 : listed?.strength ?? 1 }
     /// A new setting shares the cache; a stored one without the key runs isolated, the server's default.
     var reusesPrefixCache: Bool { setting.map { $0.prefixCache == "shared" } ?? true }
 
     func turnedOn(_ on: Bool) -> AblationSetting { edit { $0.strength = on ? strength : 0 } }
-    func choosing(_ profile: String) -> AblationSetting { edit { $0.profile = profile } }
+    /// Picking a profile seeds its measured strength when the setting is on; an off setting stays off.
+    func choosing(_ profile: String) -> AblationSetting {
+        let measured = profiles.first { $0.name == profile }?.strength
+        return edit { $0.profile = profile; if $0.strength > 0, let m = measured { $0.strength = m } }
+    }
     func withStrength(_ strength: Double) -> AblationSetting { edit { $0.strength = strength } }
     func reusingPrefixCache(_ reuse: Bool) -> AblationSetting { edit { $0.prefixCache = reuse ? "shared" : "isolated" } }
 
@@ -157,9 +195,9 @@ struct AblationControl {
         return s
     }
 
-    /// A typed strength the server accepts (0...maxStrength), else nil.
-    static func parseStrength(_ text: String) -> Double? {
-        guard let v = Double(text.trimmingCharacters(in: .whitespaces)), v >= 0, v <= maxStrength else { return nil }
+    /// A typed strength the server accepts (0...`max`), else nil.
+    static func parseStrength(_ text: String, max: Double = maxStrength) -> Double? {
+        guard let v = Double(text.trimmingCharacters(in: .whitespaces)), v >= 0, v <= max else { return nil }
         return v
     }
 

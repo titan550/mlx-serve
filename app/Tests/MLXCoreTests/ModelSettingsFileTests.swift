@@ -222,7 +222,8 @@ final class ModelSettingsFileTests: XCTestCase {
     /// An `ablation` the app cannot write back whole stays verbatim, like an
     /// unknown key: a save keeps it and the server names what is wrong.
     func testAnUnreadableAblationIsKeptVerbatim() throws {
-        let bad: [Any] = ["p", ["profile": 7], ["strength": 1], ["profile": ""], ["profile": "p", "strength": 1.5],
+        // Above 30 is past the server's cap; 1.5 is a strength the server accepts (0...30).
+        let bad: [Any] = ["p", ["profile": 7], ["strength": 1], ["profile": ""], ["profile": "p", "strength": 31],
                           ["profile": "p", "strength": true], ["profile": "p", "prefix_cache": 1],
                           ["profile": "p", "prefix_cache": "warm"], ["profile": "p", "layers": [1]]]
         for value in bad {
@@ -234,16 +235,18 @@ final class ModelSettingsFileTests: XCTestCase {
         let path = tempPath()
         try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
                                                 withIntermediateDirectories: true)
-        try #"{"/m/a": {"ctx_size": 4096, "ablation": {"profile": "p", "strength": 2}}}"#
+        try #"{"/m/a": {"ctx_size": 4096, "ablation": {"profile": "p", "strength": 31}}}"#
             .write(toFile: path, atomically: true, encoding: .utf8)
         var file = ModelSettingsFile.load(path: path)
         var o = try XCTUnwrap(file.override(for: "/m/a"))
         o.ctxSize = 8192
         file.set(o, for: "/m/a")
         try file.save(path: path)
-        let text = try String(contentsOfFile: path, encoding: .utf8)
-        XCTAssertTrue(text.contains("\"strength\" : 2"), text)
-        XCTAssertTrue(text.contains("\"ctx_size\" : 8192"), text)
+        // Parsed, not matched as text: the writer's spacing is not the contract.
+        let root = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path))) as? [String: Any]
+        let entry = root?["/m/a"] as? [String: Any]
+        XCTAssertEqual((entry?["ablation"] as? [String: Any])?["strength"] as? Double, 31)
+        XCTAssertEqual(entry?["ctx_size"] as? Int, 8192)
     }
 
     /// The menu bar writes only `ablation`: every other key stays as the file

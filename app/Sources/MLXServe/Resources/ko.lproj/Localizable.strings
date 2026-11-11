@@ -2402,6 +2402,13 @@
 "Rebuild" = "다시 빌드";
 "Not in the catalog: rebuild it from its source with this release's kit" = "카탈로그에 없음: 이 릴리스의 키트로 소스에서 다시 빌드하세요";
 "Needs rebuild" = "다시 빌드 필요";
+/* Ablation: Model Settings and the menu bar */
+"Ablation" = "어블레이션";
+"Profile" = "프로필";
+"Strength" = "강도";
+"Reuse prefix cache" = "프리픽스 캐시 재사용";
+"Applies to every request to this model, from any app. Profiles in ~/.mlx-serve/ablation load when the server starts." = "어느 앱에서 보내든 이 모델에 대한 모든 요청에 적용됩니다. ~/.mlx-serve/ablation의 프로필은 서버가 시작될 때 로드됩니다.";
+"Remove this model's ablation setting" = "이 모델의 어블레이션 설정 제거";
 
 /* Models ▸ Plugins: one-click install */
 "%@ did not install" = "%@ 설치 실패";
@@ -2448,11 +2455,3 @@
 "Quit MLX-Serve" = "MLX-Serve 종료";
 "Keep running when I press ⌘Q" = "⌘Q를 눌러도 계속 실행";
 "⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q는 창을 닫고 서버는 계속 실행됩니다. 메뉴 막대의 종료는 여전히 둘 다 중지합니다.";
-/* Ablation: Model Settings and the menu bar */
-"Ablation" = "어블레이션";
-"Profile" = "프로필";
-"Strength" = "강도";
-"Reuse prefix cache" = "프리픽스 캐시 재사용";
-"Applies to every request to this model, from any app. Profiles in ~/.mlx-serve/ablation load when the server starts." = "어느 앱에서 보내든 이 모델에 대한 모든 요청에 적용됩니다. ~/.mlx-serve/ablation의 프로필은 서버가 시작될 때 로드됩니다.";
-"Remove this model's ablation setting" = "이 모델의 어블레이션 설정 제거";
-"Strength from 0 to 1; 0 is off" = "강도는 0부터 1까지이며 0이면 꺼집니다";

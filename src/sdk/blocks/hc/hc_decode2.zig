@@ -142,30 +142,22 @@ fn aligned16(a: mlx.mlx_array) bool {
     return @intFromPtr(p) % 16 == 0;
 }
 
-/// `ab` fits a read of `rows` rows of `hidden`: whole slots of `per` rows, each with its f32 direction and strength.
-fn ablateFits(ab: Ablate, rows: c_int, hidden: c_int) bool {
-    if (ab.per < 1 or @rem(rows, ab.per) != 0 or ab.dirs.ctx == null or ab.strengths.ctx == null) return false;
-    if (mlx.mlx_array_dtype(ab.dirs) != .float32 or mlx.mlx_array_dtype(ab.strengths) != .float32) return false;
-    const slots: usize = @intCast(@divExact(rows, ab.per));
-    return mlx.mlx_array_size(ab.dirs) == slots * @as(usize, @intCast(hidden)) and mlx.mlx_array_size(ab.strengths) == slots;
-}
-
-/// What the folded launch does to `out` (`ab.per` rows per slot, any leading shape over `hidden`-wide rows): each row
+/// What the folded launch does to `out` (one slot per `dirs` row, any leading shape over `hidden`-wide rows): each row
 /// loses its slot's strength times its component along its slot's direction, in f32 with one rounding back to `out`'s
 /// dtype, as the launch rounds. The caller frees the result.
-pub fn ablateOut(s: mlx.mlx_stream, out: mlx.mlx_array, ab: Ablate) !mlx.mlx_array {
+pub fn ablateOut(s: mlx.mlx_stream, out: mlx.mlx_array, dirs: mlx.mlx_array, strengths: mlx.mlx_array) !mlx.mlx_array {
     const shape = mlx.getShape(out);
     const hidden = shape[shape.len - 1];
-    const slots: c_int = @intCast(mlx.mlx_array_size(ab.strengths));
+    const slots: c_int = @intCast(mlx.mlx_array_size(strengths));
     var o3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(o3);
     try mlx.check(mlx.mlx_reshape(&o3, out, &[_]c_int{ slots, -1, hidden }, 3, s));
     var d3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(d3);
-    try mlx.check(mlx.mlx_reshape(&d3, ab.dirs, &[_]c_int{ slots, 1, hidden }, 3, s));
+    try mlx.check(mlx.mlx_reshape(&d3, dirs, &[_]c_int{ slots, 1, hidden }, 3, s));
     var s3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(s3);
-    try mlx.check(mlx.mlx_reshape(&s3, ab.strengths, &[_]c_int{ slots, 1, 1 }, 3, s));
+    try mlx.check(mlx.mlx_reshape(&s3, strengths, &[_]c_int{ slots, 1, 1 }, 3, s));
     var o32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(o32);
     try mlx.check(mlx.mlx_astype(&o32, o3, .float32, s));
@@ -242,7 +234,13 @@ pub fn read(
     const wr: c_int = @intFromBool(pend != null);
     if (rows < 1 or mlx.mlx_array_size(x) != @as(usize, @intCast(rows * K)) or mlx.mlx_array_size(nw) != @as(usize, @intCast(K))) return null;
     const abl: ?Ablate = if (pend) |p| p.ablate else null;
-    if (abl) |v| if (!ablateFits(v, rows, hidden)) return null;
+    if (abl) |v| {
+        // Whole slots of `per` rows, each with its f32 direction and strength.
+        if (v.per < 1 or @rem(rows, v.per) != 0 or v.dirs.ctx == null or v.strengths.ctx == null) return null;
+        if (mlx.mlx_array_dtype(v.dirs) != .float32 or mlx.mlx_array_dtype(v.strengths) != .float32) return null;
+        const slots: usize = @intCast(@divExact(rows, v.per));
+        if (mlx.mlx_array_size(v.dirs) != slots * @as(usize, @intCast(hidden)) or mlx.mlx_array_size(v.strengths) != slots) return null;
+    }
     const ab: c_int = @intFromBool(abl != null);
     const per: c_int = if (abl) |v| v.per else 1;
 

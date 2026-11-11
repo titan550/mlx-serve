@@ -79,7 +79,7 @@ sys.exit(0 if eval(sys.argv[2]) else 1)' "$URL" "$1"
 check() { if eval "$2"; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1"; fail=$((fail+1)); fi; }
 
 check "stock chat answers 200" '[ "$(post chat stock)" = 200 ]'
-check "the row lists the profile made from this pack" 'curl -s "$URL/v1/models" | grep -q "\"ablation_profiles\":\[\"rand\"\]"'
+check "the row lists the profile made from this pack, with its strength" 'curl -s "$URL/v1/models" | grep -q "\"ablation_profiles\":\[{\"name\":\"rand\",\"strength\":1,\"max_strength\":30}]"' 
 setting '{"profile":"rand","strength":1,"prefix_cache":"shared"}'
 check "chat under the setting answers 200" '[ "$(post chat on)" = 200 ]'
 check "it carries X-Ablation with no key" 'grep -qi "^x-ablation: profile=rand; strength=1.000" "$WORK/on.h"'

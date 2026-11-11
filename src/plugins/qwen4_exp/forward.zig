@@ -115,6 +115,8 @@ pub fn forwardQwen4VerifyRows(
         pending: ?HcPending = null,
         /// This slot's row of `group`.
         ablation: ?Ablation = null,
+        /// The same row as a deferred write's ablation, `row.seq` rows per slot.
+        write_ab: ?hc_decode2.Ablate = null,
     };
     // Reached by symbol, past `Forward.ablation`: each slot's ablation is its engine context's; the joined reads take
     // the group's rows at once.
@@ -157,6 +159,7 @@ pub fn forwardQwen4VerifyRows(
             .generation = generation,
             .h = h,
             .ablation = ablation,
+            .write_ab = if (ablation) |*a| a.pending(seq) else null,
         };
         initialized += 1;
     }
@@ -210,7 +213,7 @@ pub fn forwardQwen4VerifyRows(
                     .full => |fa| try self.qwen4AttnWith(row.ctx, read.mixed, &fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                 };
                 defer _ = mlx.mlx_array_free(attn);
-                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, if (row.ablation) |*a| a.pending(row.seq) else null);
+                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, row.write_ab);
             }
         }
         if (group_projection) {
@@ -229,7 +232,7 @@ pub fn forwardQwen4VerifyRows(
                     .full => |*fa| try self.qwen4AttnWith(row.ctx, read.mixed, fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                 };
                 defer _ = mlx.mlx_array_free(attn);
-                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, if (row.ablation) |*a| a.pending(row.seq) else null);
+                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, row.write_ab);
             }
         }
 
@@ -263,7 +266,7 @@ pub fn forwardQwen4VerifyRows(
         }
         for (rows[0..initialized], mlp, reads[0..initialized]) |*row, value, read| {
             self.fwd_gen = row.generation;
-            try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, if (row.ablation) |*a| a.pending(row.seq) else null);
+            try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, row.write_ab);
         }
     }
 

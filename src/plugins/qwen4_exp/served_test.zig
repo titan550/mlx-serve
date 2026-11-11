@@ -19,6 +19,7 @@ const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const CaptureLayers = @import("../../engines/mlx/forward_ctx.zig").CaptureLayers;
 const AblationRequest = @import("../../sdk/request/ablation.zig").Request;
+const qwen4ReadF32 = @import("../../sdk/testing/parity.zig").qwen4ReadF32;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const nextSsmMemberGen = @import("../../engines/mlx/ssm/group.zig").nextSsmMemberGen;
@@ -302,18 +303,10 @@ test "qwen4_exp served: greedy decode and MTP rounds emit the legacy tokens and 
     }
 }
 
-fn hostF32(x: Array) ![]f32 {
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_astype(&f, x, .float32, mlx.gpuStream()));
-    try mlx.check(mlx.mlx_array_eval(f));
-    return testing.allocator.dupe(f32, mlx.mlx_array_data_float32(f).?[0..mlx.mlx_array_size(f)]);
-}
-
 /// The largest |cos| between a stream of `streams` [B, S, hc*hidden] and its batch row's direction (one per row, or one
 /// for all).
 fn maxCos(streams: Array, dirs: []const []const f32) !f64 {
-    const v = try hostF32(streams);
+    const v = try qwen4ReadF32(testing.allocator, streams, mlx.gpuStream());
     defer testing.allocator.free(v);
     const shape = mlx.getShape(streams);
     const b: usize = @intCast(shape[0]);
@@ -355,7 +348,7 @@ fn ablationDirections(p: *Pair) ![2][]f32 {
         var all = mlx.mlx_array_new();
         _ = try g.adopt(try x.forwardWithCaptureAll(&s.ctx, try tokens(&g, pr), &last, &all));
         _ = try g.adopt(last);
-        const host = try hostF32(try g.adopt(all));
+        const host = try qwen4ReadF32(testing.allocator, try g.adopt(all), mlx.gpuStream());
         defer a.free(host);
         const hidden: usize = p.scfg.hidden_size;
         const row = host[(pr.len - 1) * p.scfg.hc_count * hidden ..][0..hidden];
@@ -469,7 +462,6 @@ test "qwen4_exp served: an ablated slot's streams keep no component along its di
         }
     }
     // bf16 rounding leaves a few thousandths; a write that skips the projection leaves tenths.
-    std.debug.print("qwen4 ablation: worst |cos| with the ablated direction {d:.5}\n", .{worst});
     try testing.expect(worst <= 0.02);
 }
 
@@ -504,7 +496,7 @@ test "qwen4_exp served: an unablated slot batched beside an ablated one keeps th
         }
         for (rows) |r| _ = try g.adopt(r);
         for (hidden.?) |h| _ = try g.adopt(h);
-        got[run] = try hostF32(rows[1]);
+        got[run] = try qwen4ReadF32(testing.allocator, rows[1], mlx.gpuStream());
     }
     defer for (got) |v| a.free(v);
     try testing.expectEqualSlices(f32, got[0], got[1]);
