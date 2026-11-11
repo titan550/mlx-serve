@@ -440,7 +440,7 @@ class APIClient {
         /// Moves whenever `/v1/models` would read differently; nil from older servers.
         let registryGeneration: UInt64?
         /// Filed under the model the request named; nil for the bare route.
-        var ablation: AblationStatus? = nil
+        let ablation: AblationStatus?
     }
 
     /// `model` names the model the per-model parts describe; nil = the server's default.

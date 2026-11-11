@@ -158,7 +158,10 @@ pub fn hcReadFusedFor(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, 
     const hp = @import("../../sdk/blocks/hc/hc_prefill.zig");
     if (hp.eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(stream))) {
         // The prefill norms have no ablation arm: they take the pending write's `out` projected.
-        const projected: ?mlx.mlx_array = if (pend) |p| (if (p.ablate) |ab| try hc_decode2.ablateOut(self.s, p.out, ab.dirs, ab.strengths) else null) else null;
+        const projected: ?mlx.mlx_array = if (pend) |p| blk: {
+            const ab = p.ablate orelse break :blk null;
+            break :blk try hc_decode2.ablateOut(self.s, p.out, ab.dirs, ab.strengths);
+        } else null;
         defer if (projected) |o| {
             _ = mlx.mlx_array_free(o);
         };
