@@ -1,11 +1,25 @@
 # Ledger of the fork's changes (see CHANGE-POLICY.md §5)
 
+Entry names are the feature they carry (the old two-letter ids are in the table below, so an older note or commit
+message still finds its entry).
+
+| old id | entry |
+|---|---|
+| F1 | `dev-build-version` |
+| CR-A | `qwen4-exp-ablation` |
+| CR-B | `ablation-prefix-cache` |
+| CR-C | `ablation-model-setting` |
+| CR-E | `ablation-strength-range` |
+| CR-G | `ablation-profile-strength` |
+| CR-F | `ablation-profile-name` (dropped) |
+| D1 | `per-layer-steering` (dropped) |
+
 Base: `v26.11.2`. `fork-main` = base + merges of the active entries. Budget check (fork-only entries, upstream
 files): run `git diff --numstat origin/main fork-main` filtered to files on `origin/main`; as of 2026-11-06 the
 whole delta is +1671/−359 over 52 upstream files, all of it in entries with PRs intended, so the fork-only
-count is F1's 2 lines.
+count is `dev-build-version`'s 2 lines.
 
-### F1 — a dev build names itself (`MLX_SERVE_DEV_VERSION`) and stages its own plugin kit
+### dev-build-version — a dev build names itself (`MLX_SERVE_DEV_VERSION`) and stages its own plugin kit
 - Level: L3 + L4          Status: active (2026-11-06)
 - Why: `app/build.sh`'s no-`gh` arm reads the tracked plist, which says the last release upstream stamped
   there (26.11.1 even on the v26.11.2 tag). The app matches a plugin kit by that string, so a fork build
@@ -26,7 +40,7 @@ count is F1's 2 lines.
   either; the fork adopts releases by hand (CHANGE-POLICY §6). A `-` suffix would sort below the release
   and nag forever.
 
-### CR-A — qwen4_exp serves directional ablation (`Caps.ablation`)
+### qwen4-exp-ablation — qwen4_exp serves directional ablation (`Caps.ablation`)
 - Level: L5          Status: active, PR pending the owner's review
 - Why: upstream's #1045 gave the server per-request ablation but no in-tree model declares the cap; the
   fork's steering (PR #538, closed) needed a sanctioned seam.
@@ -44,7 +58,7 @@ count is F1's 2 lines.
 - Notes: a direction built with thinking off does nothing with thinking on (STRML, #1045); rebuild with
   thinking on (roadmap).
 
-### CR-B — `prefix_cache`: isolated | shared for ablated requests (two modes)
+### ablation-prefix-cache — `prefix_cache`: isolated | shared for ablated requests (two modes)
 - Level: L5          Status: active (revised 2026-11-09), PR pending the owner's review
 - Revision: `read` dropped (merged `0846990c`) — it had no consumer beyond a request naming it. With it gone a
   request has nothing left to choose (`isolated` is what it gets; `shared` is the operator's call because it
@@ -61,15 +75,15 @@ count is F1's 2 lines.
 - Upstream: yes (PR B).       If declined: carry; or reshape so the model setting alone selects it.
 - Drop when: upstream adopts a cache-reuse mode for ablation.
 
-### CR-C — per-model `ablation` setting (`model-settings.json`), `/props` + `/v1/models` rows, app UI
+### ablation-model-setting — per-model `ablation` setting (`model-settings.json`), `/props` + `/v1/models` rows, app UI
 - Level: L1 + L5          Status: active; upstream as an issue first (UI is a harder sell)
 - Why: every client of the server should be steered without sending a field; the owner wants the menu-bar
   control and Model Settings section the old fork had.
-- Branch: `ablation/model-default`       Files touched: `sdk/request/ablation.zig`, `model_settings.zig`,
+- Branch: `ablation/model-setting`       Files touched: `sdk/request/ablation.zig`, `model_settings.zig`,
   `host/api/ablation.zig`, anthropic/responses/props/models surfaces, `tests/test_ablation_model_setting.sh`;
   app `Models/Ablation.swift` (new), `Views/AblationControls.swift` (new), `ServerOptions`, `ServerManager`,
   `APIClient`, `ChatModels`, `ModelSettingsFile`, `ModelSettingsSheet`, `StatusMenuView`, localizations,
-  `app/CLAUDE.md`       Upstream-file lines: +1538/−301 (cumulative with CR-B's base)
+  `app/CLAUDE.md`       Upstream-file lines: +1538/−301 (cumulative with `ablation-prefix-cache`'s base)
 - Conflict points: the four API surfaces' request parsing; `ModelSettingsSheet`; `StatusMenuView`.
 - Off switch: no `ablation` entry in the model's settings.
 - Tests: model_settings, props, anthropic, responses suites; app tests (4308, 0 failures).
@@ -78,7 +92,7 @@ count is F1's 2 lines.
 - Drop when: upstream has a server-side default for ablation.
 - Notes: steering-lab's "off" arms are ablated by this setting until the lab sends strength 0.
 
-### CR-E — ablation strength above 1 (one constant, `max_strength = 30`)
+### ablation-strength-range — ablation strength above 1 (one constant, `max_strength = 30`)
 - Level: L4          Status: active, merged to `fork-main` 2026-11-08 (`e5b705ba`)
 - Why: upstream documents a strength in (0, 1]. Measured on Sushi-STQ-1.75bpw, one direction, thinking off:
   s=1 leaves 11/15 refusing, s=2 5/15, s=3 1/15, s=4 0/15, with 0/10 benign over-refusals at every step.
@@ -97,11 +111,11 @@ count is F1's 2 lines.
   single direction captured thinking off): no ablation 97/99 (0.98) and 8/100 (0.08); strength 3 at layer 37
   6/99 (0.061) and 4/100 (0.04); **strength 4 at layer 37 4/99 (0.04) and 2/100 (0.02)** — adopted as the
   model's setting. A "never refuse" system prompt stacked on strength 3 was 9/99 (0.091) against strength 3's
-  6/99: no help, within noise. A per-layer bank at strength 4 was 7/15 and 2/10 on the screening set (CR-F).
+  6/99: no help, within noise. A per-layer bank at strength 4 was 7/15 and 2/10 on the screening set (`ablation-profile-name`).
 - Upstream: yes, and it is the best single candidate (2 lines of behaviour, with numbers).
 - Drop when: upstream's `Ablation` range changes on its own.
 
-### CR-G — a profile declares its strength and its measured ceiling
+### ablation-profile-strength — a profile declares its strength and its measured ceiling
 - Level: L4/L5          Status: active, merged 2026-11-09
 - Why: the safe strength is a property of the PROFILE, not of the caller. Measured on Qwen3.8-Flash-Next
   (qwen4_exp, hyper-connections): strength 1 is byte-identical to no ablation on 6/8 benign prompts; strength 3
@@ -121,7 +135,7 @@ count is F1's 2 lines.
 - Off switch: a manifest without `strength`/`max_strength` behaves exactly as before (default 1, ceiling 30).
 - Tests: ablation 76/76, model_settings 80/80, `test_ablation_model_setting.sh` 11/11, app
   `AblationControlTests` 11/11 + `AblationServerReportTests` 3/3.
-- Upstream: plausible as "a profile carries the strength it was measured at"; it also makes CR-E safer.
+- Upstream: plausible as "a profile carries the strength it was measured at"; it also makes `ablation-strength-range` safer.
 - Drop when: upstream's manifest gains a strength field of its own.
 
 ### Thinking on vs off (measurement, not a code change)
@@ -135,7 +149,7 @@ count is F1's 2 lines.
 - If steering a thinking request ever matters, fit it on the residual (3 prompts here), never reuse a
   thinking-off direction — the earlier 14/15 reading was the same non-transfer, not a mode artifact.
 
-### CR-F — `abi.Ablation.name` (the profile's directory name, so a plugin can load a per-layer bank)
+### ablation-profile-name — `abi.Ablation.name` (the profile's directory name, so a plugin can load a per-layer bank)
 - Level: L5          Status: **DROPPED, not built** (2026-11-08)
 - Why it was proposed: an outside plugin (`sushi_ds41`) wanted to load a per-layer `bank.f32` by profile name;
   upstream's `Ablation` carries only `directions`/`strengths`/`keys`.
@@ -151,7 +165,7 @@ count is F1's 2 lines.
 - Drop when: n/a — dropped. Reopen only for a per-site concept (a different direction per layer on purpose,
   not one concept sharpened), which needs no ABI field: the manifest's `pick` can carry a site map.
 
-### D1 — per-layer steering bank for qwen4_exp (PR #538)
+### per-layer-steering — per-layer steering bank for qwen4_exp (PR #538)
 - Level: L5          Status: dropped (2026-11-05) → tag `steering-bank-v1`, branches on `private`
 - Why dropped: owned an ABI bit, a route (`/v1/steering`) and a CLI; conflicted on every merge; upstream's
   #1045 is the sanctioned seam and single-direction ablation proved sufficient (user test 2026-11-06).
@@ -165,14 +179,13 @@ count is F1's 2 lines.
   8 elements), so the patches are obsolete and their branches were based on an ancient tree.
 
 ## Planned (not implemented; call out before starting, §4)
-- **CR-D** — env-gated capture tap in qwen4_exp (`QWEN4_TAP_DIR`, <100 lines, one plugin folder), sushi's
-  shape. L5, upstream-worthy.
-- **CR-E** — DONE as `fork/cr-e-strength` (merged 2026-11-08): see the entry below.
-- **Native DeepSeek ablation** in `deepseek_v41` — only if Pruned192 beats Sushi on quality (roadmap step 4).
-  L5, CR-A-sized.
+- **`qwen4-exp-capture-tap`** — env-gated capture tap in qwen4_exp (`QWEN4_TAP_DIR`, <100 lines, one plugin
+  folder), sushi's shape. L5, upstream-worthy.
+- **`deepseek-v41-ablation`** — `Caps.ablation` on the in-tree plugin. Plan: `local/notes/native-ds41-ablation-plan-2026-11-09.md`
+  (tap first, fusion declined). L5.
 - **Plugin side (CommunityServe/plugins, not this repo):** `expert_pick_tolerance` as a sushi_ds41 model
   setting; the `PREFILL_TOP_K` lines folded into a patch file. L2.
-- **Dev-build kit in the app** — Install uses the build's own kit for a non-release version. Supersedes F1's
+- **Dev-build kit in the app** — Install uses the build's own kit for a non-release version. Supersedes `dev-build-version`'s
   env var. L4, upstream-worthy.
 
 ## Outside plugins reviewed (CHANGE-POLICY §4 L2)
@@ -181,7 +194,7 @@ count is F1's 2 lines.
   `00f9bec` (2026-11-07; the delta from `59473a90` is `plugin.json` title/homepage/icon metadata and an
   `icon.png`, no code). Installed by `local/build.sh plugins` 2026-11-07, sha256 `4804d9cd…`.
 - `sushi_ds41` @ CommunityServe/plugins `e09865e` (2026-11-09): single-direction ablation; the per-layer bank
-  is reverted (measured worse, CR-F) and kept on branch `feature/per-layer-bank` in the plugin checkout. The
+  is reverted (measured worse, `ablation-profile-name`) and kept on branch `feature/per-layer-bank` in the plugin checkout. The
   strength cap follows the host's `max_strength` (30). Superseded text of the bank entry follows. The forward's
   ablation now carries the profile's directory name (a new `name` field on the fork's `abi.Ablation`,
   threaded host→engine→plugin), so the plugin loads that profile's per-layer `bank.f32` (one direction per
