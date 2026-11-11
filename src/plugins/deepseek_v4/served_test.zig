@@ -415,6 +415,8 @@ const Requests = struct {
         hc.disk = try @import("../../engines/mlx/load.zig").initPrefixDisk(testing.allocator, h.sch.io, path, "module-requests", 0, 512, prefix_cache.ModuleBinding.init(&p.xfm).?, path);
         hc.disk.?.armTestSpace(1 << 40, 2 << 40);
         hc.armDiskTier(&p.cfg);
+        // These tests exercise the write path, not the wait before it.
+        hc.module_quiet_ms = 0;
         try testing.expect(!hc.ssd_first);
         try testing.expect(hc.disk.?.writer != null);
     }
@@ -935,7 +937,8 @@ test "deepseek_v41 served: an excluded instance keeps legacy resume through requ
     const p = try Served.open(&P.table, try fixture.v41Files(arena.allocator(), 7), "");
     defer p.close();
     const m: *P.Model = @ptrCast(@alignCast(p.xfm.plugin.?.model));
-    m.cfg.dsv41_streamed = true;
+    m.bank_streams = true;
+    defer m.bank_streams = false;
     try testing.expect(!prefix_cache.HotPrefixCache.shouldUseInstance(&p.cfg, true, &p.xfm));
     const h = try Requests.open(p);
     defer h.close();

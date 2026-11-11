@@ -166,7 +166,8 @@ pub fn flushOwedDiskSlices(sch: *Scheduler) prefix_cache_mod.FlushResult {
     for (owed[0..diskCaches(sch, &owed, true)]) |o| {
         const slice = if (admitModuleStaging(sch, o.hc)) o.hc.flushOwedSlice(o.s) else .busy;
         if (slice == .progress) result = .progress;
-        if (slice == .busy and result == .done) result = .busy;
+        if (slice == .busy and result != .progress) result = .busy;
+        if (slice == .quiet and result == .done) result = .quiet;
     }
     return result;
 }
@@ -499,6 +500,9 @@ test "module live residency is counted once per model and cannot be credited as 
     sch.digest_mu = .init;
     sch.queue_mu = .init;
     sch.decoding = .empty;
+    sch.pending = .empty;
+    sch.cleanup_queue = .empty;
+    sch.offloaded = .empty;
     sch.resident_hot_cache_bytes = .init(0);
     sch.reclaimable_hot_cache_bytes = .init(0);
     sch.resident_live_kv_bytes = .init(0);

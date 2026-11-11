@@ -133,14 +133,14 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_ds4_serve.sh`, `test_ds4_smoke.sh`, `test_ds4_ssd_streaming.sh` ds4 · `test_mlx_gguf.sh` MLX GGUF · `test_qwen4exp_gguf_route.sh`
 - `test_ane_prefill.sh`, `test_ane_engine.sh` Neural Engine · `test_mlx_staged_nax.sh` **H** NAX-enabled mlx stage
 - `test_phase2_forward_equivalence.sh` forward pinned vs a baseline · `test_decode_graph_dump.sh` graph dump guard
-- `test_plugin_kit.sh` **H** the kit builds `_example` from itself; `plugin new|check|fixture|install`; a kit-built dylib serves its pack
+- `test_plugin_kit.sh` **H** the kit builds `_example` and `_example_engine` from itself; `plugin new|check|fixture|install`; a kit-built dylib serves its pack, the engine its named folder
 
 **Architectures (live)**
 - `test_qwen4_exp.sh` **E** Flash Next (external PLE or embedded `shards.N` / `shard_N`) · `test_qwen4_mtp_{padded_head,head_persist}.sh` **E** its MTP head
 - `test_qwen4_ablation.sh` **E** Flash Next directional ablation: strength 0 = stock bytes, strength 1 changes the answer, the fold engaged
 - `test_qsa_nax_prefill.py` **R** QSA NAX prefill · `qsa_nax_precision.py` float64 QSA kernel oracle
 - `test_dsv4.sh` **E**, `test_dsv41.sh` **E** DeepSeek V4/V4.1 · `test_inkling.sh` **E** · `test_bailing_hybrid.sh` **E** Ling 3.0
-- `test_muse_glimmer.sh` **E**, `test_muse_repetition.sh` **E** Muse · `test_mimo_v2.sh` **E** · `test_glm5_next.sh` **E** · `test_glm53.sh` **E**
+- `test_muse_glimmer.sh` **E**, `test_muse_repetition.sh` **E** Muse · `test_mimo_v2.sh` **E** · `test_glm5_next.sh` **E**
 - `test_flint.sh` **E** · `test_kolibri1.py` **E** · `test_minicpmv4_7.sh` **E** · `test_nemotron_bolt.py` Nemotron 3.5
 - `test_ud_moe.sh` · `test_nvfp4.sh` · `test_dense_bf16.sh` · `test_hadamard_fidelity.sh` (+ `hadamard_fidelity.py`)
 - `test_kev_decisions.sh`, `test_laya_decisions.sh`, `test_d1_decisions.sh` POST /v1/decisions
@@ -160,7 +160,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_image_gen.sh` FLUX.2 · `test_image_cancel.sh` · `test_flux_lowmem.sh` · `test_krea_gen.sh` · `test_mageflow_edit.sh`
 - `test_qwen_image_gen.sh` · `test_qwen_image_lora.sh` (+ `qwen_image_lora_metrics.py`) · `test_moss_image_gen.sh`
 - `test_multi_lora.sh` stacked LoRAs · `test_real_loras.sh` Hub LoRAs (+ `lora_noise.py`) · `test_media_gen_memory.sh` · `test_media_eviction_gate.sh` **H**
-- `test_video_gen.sh` LTX · `test_video_preview.sh` (part **H**) · `test_minimax_h3.sh`, `test_h3_resident.sh`, `test_fasth3_omni.sh` H3
+- `test_video_gen.sh` LTX · `test_video_preview.sh` (part **H**) · `test_minimax_h3.sh`, `test_h3_resident.sh`, `test_fasth3_omni.sh` H3 · `test_minimax_h3_image.sh` H3-Image
 - `test_tts.sh`, `test_tts_quant.sh`, `test_tts_clone_cache.sh`, `test_tts_language.sh` Qwen3-TTS · `test_kokoro_tts.sh`
 - `test_music_gen.sh` ACE-Step · `test_music3_gen.sh` · `test_yue2_gen.sh` · `test_sound_gen.sh` Stable Audio 3
 - `test_3d_gen.sh`, `test_3d_paint.sh` Hunyuan3D · `test_trellis2_3d.sh` · `test_pixal3d_3d.sh` · `test_idol_3d.sh` · `film_skill.test.mjs` **H**
@@ -168,6 +168,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 **Static and release guards** (all **H**)
 - `test_build_env_reaches_tests.sh` a shell variable reaches `zig build test` on a cached configuration
 - `test_release_workflow_gates.sh` release.yml + app/build.sh · `test_release.sh` release.sh · `test_resource_xattrs.sh`
+- `test_dev_version.sh` a source build stamps the newest release tag behind HEAD (`scripts/dev-version.sh`)
 - `test_model_card_frontmatter.sh` converter model cards · `test_website_pages.sh` · `website_benchmarks_logic.mjs`, `website_tier_list_logic.mjs`
 
 **Benchmarks and diagnostics** (measurements, not pass/fail; method in the `/bench` skill)
@@ -180,7 +181,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `convert_{acestep_weights,dsv4_weights,hunyuan3d_weights,hunyuan3d_paint_weights,idol_weights,kev_weights,kokoro_weights,mageflow_weights,mimo_v2,minicpmv4_7,minimax_h3_weights,moss_image_weights,nemotron_lilicorr,nemotron_transcribe,qwen38_flash_next,qwen38_iq,qwen_image21_weights,trellis2_pixal3d,yue2}.py`
 - `fetch_convert_dsv4_0731.py`, `fetch_convert_minimax_h3_ref2va.py` disk-safe fetch+convert · `graft_qwen_image21_vision.py`
 - `requant_qwen4_pack.py`, `restandardize_qwen38_pack.py` repack in place · `verify_nemotron_lilicorr.py`
-- `test_convert_{minicpmv4_7,minimax_h3_omni,nemotron_lilicorr,qwen38_flash_next_bf16}.py` **H** converter checks (mlx or torch)
+- `test_convert_{minicpmv4_7,minimax_h3_image,minimax_h3_omni,nemotron_lilicorr,qwen38_flash_next_bf16}.py` **H** converter checks (mlx or torch)
 - `dsv4_imatrix.py` weighted affine quant · `qwen38_imatrix_collect.py`, `qwen38_iq_allocate.py`, `qwen38_iq_battery.py` 27B iQ
 - `qwen38_flash_next_imatrix_collect.py`, `qwen38_flash_next_iq_allocate.py`, `qwen38_flash_next_score.py` Flash Next iQ
 

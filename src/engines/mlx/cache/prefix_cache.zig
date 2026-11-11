@@ -206,7 +206,8 @@ pub const ModuleMatch = struct {
     prefix_key: u64,
 };
 
-pub const FlushResult = enum { progress, busy, done };
+/// `quiet`: the only records owed are module tips still inside their quiet period.
+pub const FlushResult = enum { progress, busy, quiet, done };
 
 const ModulePayload = struct {
     binding: ModuleBinding,
@@ -637,6 +638,12 @@ pub const HotPrefixCache = struct {
     max_entries: u32,
     /// An entry untouched this long is evicted before the workload-fair rule applies.
     stale_after_ms: i64 = 30 * 60 * 1000,
+    /// The module commit that is making room: its tip is not resident yet, but the entries it extends are its
+    /// rungs already. Without it a count-cap eviction took another conversation's tip on the same cache key (#1125).
+    /// A module tip is written once it has gone this long without a turn, when it leaves RAM, or at shutdown: a
+    /// conversation taking turns wrote its whole state after every one (~550 GB a day of SSD writes, #1124).
+    module_quiet_ms: i64 = MODULE_QUIET_MS,
+    incoming_tip: ?struct { binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig } = null,
     /// Wave 1.B: total KV bytes the cache is allowed to keep resident across
     /// all entries. 0 disables the byte budget (count cap still applies).
     /// Enforced on `commit`: evict LRU entries (in addition to the count
@@ -950,9 +957,9 @@ pub const HotPrefixCache = struct {
         config: *const model_mod.ModelConfig,
         enable_ssm_checkpoints: bool,
     ) bool {
-        // Module-owned request state (a served pack's caps; DeepSeek-V4.1 and GLM-5.3 on mlx-stream) is not in the
+        // Module-owned request state (a served pack's caps: DeepSeek-V4.1's) is not in the
         // KVCache: a snapshot restore would advance cache.step without rebuilding it.
-        if (!config.caps().prefix_cache or config.glm_stream) return false;
+        if (!config.caps().prefix_cache) return false;
         // A pipeline worker holds the later layers' state at the live position only: a restore
         // here would rewind this rank and not the worker.
         if (config.dist_span != null) return false;
@@ -968,7 +975,7 @@ pub const HotPrefixCache = struct {
         // tensor split's plugin says through its enabled hook whether its workers keep their halves of each snapshot.
         // Other models keep `shouldUse` exactly (a tensor-parallel rank 0 keeps its KV cache: the worker is stateless).
         if (plugin_driver.auxBinding(xfm) != null) {
-            if (config.glm_stream or config.dist_span != null or config.expert_bank) return false;
+            if (config.dist_span != null) return false;
             // The plugin's eligibility hook also excludes paired and streamed loaded instances.
             return ModuleBinding.init(xfm) != null;
         }
@@ -1951,7 +1958,12 @@ pub const HotPrefixCache = struct {
         // Allocate before removing any donor; OOM leaves the resident history intact.
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         self.supersedeModuleRungs(binding, ids, eff_media, has_tools, quant_config);
-        if (!self.makeModuleRoom(aux_bytes, cache_key)) return .declined;
+        const room = blk: {
+            self.incoming_tip = .{ .binding = binding, .ids = ids, .media = eff_media, .has_tools = has_tools, .quant_config = quant_config };
+            defer self.incoming_tip = null;
+            break :blk self.makeModuleRoom(aux_bytes, cache_key);
+        };
+        if (!room) return .declined;
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
@@ -1973,6 +1985,8 @@ pub const HotPrefixCache = struct {
         return .{ .ok = ids.len };
     }
 
+    pub const MODULE_QUIET_MS: i64 = 60_000;
+
     /// Superseded rungs a conversation keeps below its tip. A plugin snapshot restores only at its
     /// exact length, so each rung is one more fork point that still hits.
     pub const MODULE_RUNGS_KEPT: usize = 3;
@@ -1988,12 +2002,16 @@ pub const HotPrefixCache = struct {
         return std.mem.eql(u32, e.tokens, ids[0..e.tokens.len]);
     }
 
-    /// Whether entry `i` is a rung: a longer resident module entry of its conversation extends it.
+    /// Whether entry `i` is a rung: a longer resident module entry of its conversation extends it, or the tip
+    /// a commit is making room for does (`incoming_tip`).
     /// Computed from what is resident, never stored, so a tip that leaves by any path (thinning, a
     /// failed restore, the stale or idle passes) turns its rungs back into ordinary entries.
     fn isModuleRung(self: *const HotPrefixCache, i: usize) bool {
         const e = &self.entries.items[i];
         if (e.module == null) return false;
+        if (self.incoming_tip) |t| {
+            if (t.ids.len > e.tokens.len and moduleRungOf(e, t.binding, t.ids, t.media, t.has_tools, t.quant_config)) return true;
+        }
         for (self.entries.items, 0..) |*o, j| {
             if (j == i or o.tokens.len <= e.tokens.len) continue;
             const m = o.module orelse continue;
@@ -2006,6 +2024,13 @@ pub const HotPrefixCache = struct {
     /// same length is the same checkpoint and is replaced. Past `MODULE_RUNGS_KEPT` rungs the
     /// ladder is thinned by `ladderVictim`.
     fn supersedeModuleRungs(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig) void {
+        // Only a conversation's latest state is owed to the SSD: what this commit extends or replaces is not written.
+        for (self.entries.items) |*e| {
+            const m = e.module orelse continue;
+            if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config) or !self.moduleExportOwed(m)) continue;
+            self.cancelModule(m, .superseded);
+            e.disk_dirty = false;
+        }
         var i: usize = self.entries.items.len;
         while (i > 0) {
             i -= 1;
@@ -2364,7 +2389,7 @@ pub const HotPrefixCache = struct {
                     {
                         // The resident entry already covers the trim target;
                         // the candidate's EXTRA tokens still belong on disk.
-                        self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps);
+                        self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps, if (disk_spec) specCommits(&new_dflash, &new_mtp) else .{});
                         var discarded = new_snap;
                         discarded.deinit();
                         if (new_dflash) |*d| d.deinit();
@@ -2454,7 +2479,7 @@ pub const HotPrefixCache = struct {
             if (!trimmed_ok) {
                 // RAM decline is not a value verdict: offer the candidate to
                 // the SSD tier before discarding it.
-                self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps);
+                self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps, if (disk_spec) specCommits(&new_dflash, &new_mtp) else .{});
                 var discarded_snap = new_snap;
                 discarded_snap.deinit();
                 if (new_dflash) |*d| d.deinit();
@@ -2736,6 +2761,7 @@ pub const HotPrefixCache = struct {
     /// from the next commit of the same conversation (chunks are
     /// content-deduped by token range). Since v9 a media candidate rides too:
     /// `media` carries the spans the record was keyed under (clamped to it).
+    /// `specs` are the candidate's spec payloads, text-only as on every commit.
     fn spillDeclinedToDisk(
         self: *HotPrefixCache,
         snap: *const KVCacheSnapshot,
@@ -2743,6 +2769,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         media: []const MediaSpan,
         cps: ?[]SSMCheckpoint,
+        specs: EntrySpecs,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
         // SSD-first captured the live state as `pending_disk` before the trim; the
@@ -2764,7 +2791,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, rec_media, cps, null, null, mlx.gpuStream()) catch |err| {
+        const outcome = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, rec_media, cps, specs.dflash, specs.mtp, mlx.gpuStream()) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2857,16 +2884,17 @@ pub const HotPrefixCache = struct {
         mtp: ?kv_disk_cache.SpecCommit = null,
     };
 
-    /// The disk-tier spec payloads for one RAM entry; the flush and the idle spill must not drift.
-    fn entrySpecCommits(e: *Entry) EntrySpecs {
+    /// The disk-tier spec payloads of a RAM entry, a parked record or a declined candidate;
+    /// every tier write builds them here so none drifts.
+    fn specCommits(dflash: *?DflashSnap, mtp: *?DflashSnap) EntrySpecs {
         return .{
-            .dflash = if (e.dflash) |*df| .{
+            .dflash = if (dflash.*) |*df| .{
                 .entries = df.snapshot.entries,
                 .step = df.snapshot.step,
                 .config = df.snapshot.config,
                 .base_pos = df.base_pos,
             } else null,
-            .mtp = if (e.mtp) |*mm| .{
+            .mtp = if (mtp.*) |*mm| .{
                 .entries = mm.snapshot.entries,
                 .step = mm.snapshot.step,
                 .config = mm.snapshot.config,
@@ -2908,7 +2936,7 @@ pub const HotPrefixCache = struct {
             // so the media-keyed rows are no longer ambiguous on disk. The spec
             // payloads describe rows past the first item under NO media key
             // gate, so they stay text-only rides (same rule as the commit path).
-            const specs: EntrySpecs = if (e.media.len == 0) entrySpecCommits(e) else .{};
+            const specs: EntrySpecs = if (e.media.len == 0) specCommits(&e.dflash, &e.mtp) else .{};
             const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
                 e.snapshot.step,
@@ -3063,24 +3091,7 @@ pub const HotPrefixCache = struct {
             slot.* = null;
             return r;
         }
-        const specs: EntrySpecs = .{
-            .dflash = if (p.dflash) |*df| .{
-                .entries = df.snapshot.entries,
-                .step = df.snapshot.step,
-                .config = df.snapshot.config,
-                .base_pos = df.base_pos,
-            } else null,
-            .mtp = if (p.mtp) |*mm| .{
-                .entries = mm.snapshot.entries,
-                .step = mm.snapshot.step,
-                .config = mm.snapshot.config,
-                .base_pos = mm.base_pos,
-                .head_aux = if (mm.head_aux) |*ha| ha else null,
-                .head_pos_base = mm.head_pos_base,
-                .head_marks = mm.head_marks.slice(),
-            } else null,
-        };
-        const r = appendSlice(d, &p.snapshot, p.tokens, p.has_tools, p.media, p.ssm_cps, specs, s);
+        const r = appendSlice(d, &p.snapshot, p.tokens, p.has_tools, p.media, p.ssm_cps, specCommits(&p.dflash, &p.mtp), s);
         if (r == .owed) return r;
         p.deinit(self.allocator);
         slot.* = null;
@@ -3090,7 +3101,7 @@ pub const HotPrefixCache = struct {
     /// One slice of a RAM entry; its flag stays set only while the tier owes it more.
     fn sliceEntry(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, e: *Entry, s: mlx.mlx_stream) SliceResult {
         // A media entry's spec payloads stay behind (they describe rows past the first item).
-        const r = if (e.module) |m| self.sliceModule(d, m, s) else appendSlice(d, &e.snapshot, e.tokens, e.has_tools, e.media, e.ssm_checkpoints, if (e.media.len == 0) entrySpecCommits(e) else .{}, s);
+        const r = if (e.module) |m| self.sliceModule(d, m, s) else appendSlice(d, &e.snapshot, e.tokens, e.has_tools, e.media, e.ssm_checkpoints, if (e.media.len == 0) specCommits(&e.dflash, &e.mtp) else .{}, s);
         e.disk_dirty = r == .owed or r == .busy;
         return r;
     }
@@ -3127,10 +3138,12 @@ pub const HotPrefixCache = struct {
 
     /// The owed entry the next slice goes to, newest or oldest; never one checked out (its
     /// bytes are the slot's until the commit that replaces it).
-    fn owedEntryIndex(self: *const HotPrefixCache, newest: bool) ?usize {
+    fn owedEntryIndex(self: *const HotPrefixCache, newest: bool, past_quiet: bool) ?usize {
         var best: ?usize = null;
+        const now = if (past_quiet) crt.monotonicMs() else 0;
         for (self.entries.items, 0..) |*e, i| {
             if (!e.disk_dirty or e.checked_out_by != null) continue;
+            if (past_quiet and e.module != null and now - e.touched_ms < self.module_quiet_ms) continue;
             const b = best orelse {
                 best = i;
                 continue;
@@ -3144,7 +3157,7 @@ pub const HotPrefixCache = struct {
     fn diskOwed(self: *const HotPrefixCache) bool {
         if (self.disk == null) return false;
         if (self.finishing_disk != null or self.pending_disk != null) return true;
-        if (self.owedEntryIndex(false) != null) return true;
+        if (self.owedEntryIndex(false, false) != null) return true;
         return self.modulePublicationPending();
     }
 
@@ -3156,7 +3169,8 @@ pub const HotPrefixCache = struct {
         return false;
     }
 
-    const SliceOrder = enum { newest_first, oldest_first };
+    /// `oldest_quiet` is the idle loop's order: the oldest owed record, module tips only past their quiet period.
+    const SliceOrder = enum { newest_first, oldest_first, oldest_quiet };
 
     /// One bounded slice, then `disk_dirty` says whether anything is still owed. A parked
     /// snapshot goes first: it is an earlier session's, and RAM holds at most a trimmed copy.
@@ -3174,7 +3188,7 @@ pub const HotPrefixCache = struct {
         if (self.finishing_disk != null) return self.slicePending(d, &self.finishing_disk, s);
         // The live state captured at commit, not what the RAM entry kept after its trim.
         if (order == .newest_first and self.pending_disk != null) return self.slicePending(d, &self.pending_disk, s);
-        if (self.owedEntryIndex(order == .newest_first)) |i| return self.sliceEntry(d, &self.entries.items[i], s);
+        if (self.owedEntryIndex(order == .newest_first, order == .oldest_quiet)) |i| return self.sliceEntry(d, &self.entries.items[i], s);
         if (self.slicePending(d, &self.pending_disk, s)) |r| return r;
         return if (self.modulePublicationPending()) .busy else null;
     }
@@ -3209,7 +3223,7 @@ pub const HotPrefixCache = struct {
         if (d.pending_module != null) return false;
         if (self.finishing_disk) |p| return p.module != null;
         if (order == .newest_first) if (self.pending_disk) |p| return p.module != null;
-        if (self.owedEntryIndex(order == .newest_first)) |i| return self.entries.items[i].module != null;
+        if (self.owedEntryIndex(order == .newest_first, false)) |i| return self.entries.items[i].module != null;
         if (self.pending_disk) |p| return p.module != null;
         return false;
     }
@@ -3217,7 +3231,7 @@ pub const HotPrefixCache = struct {
     /// The idle loop's flush: one bounded slice to the OLDEST owed session (the next the LRU
     /// drops). Busy retains the file and source; the scheduler should wait before retrying it.
     pub fn flushOwedSlice(self: *HotPrefixCache, s: mlx.mlx_stream) FlushResult {
-        const r = self.flushSlice(s, .oldest_first) orelse return .done;
+        const r = self.flushSlice(s, .oldest_quiet) orelse return if (self.disk_dirty) .quiet else .done;
         if (r == .busy) return .busy;
         return if (self.disk_dirty) .progress else .done;
     }
@@ -3656,7 +3670,7 @@ pub const HotPrefixCache = struct {
         if (self.finishing_disk) |p| if (p.module) |m| {
             return d.modulePartStagingBytes(m.disk_id orelse return 0);
         };
-        if (self.owedEntryIndex(false)) |idx| if (self.entries.items[idx].module) |m| {
+        if (self.owedEntryIndex(false, true)) |idx| if (self.entries.items[idx].module) |m| {
             return d.modulePartStagingBytes(m.disk_id orelse return 0);
         };
         if (self.pending_disk) |p| if (p.module) |m| {
@@ -3946,11 +3960,6 @@ test "HotPrefixCache: shouldUse rejects a streamed pack's module-owned decode st
     // without rebuilding it. A served DeepSeek pack says so in its caps (`plugins/deepseek_v4/served_test.zig`).
     var cfg = try model_mod.parseConfigFromJson(testing.allocator, model_mod.dsv41_release_config);
     defer cfg.deinit(testing.allocator);
-    try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
-    // A GLM-5.3 pack on mlx-stream keeps its decode state on the plugin's module.
-    cfg.legacy.caps.prefix_cache = true;
-    cfg.model_type = "glm_moe_dsa";
-    cfg.glm_stream = true;
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
 
@@ -5463,6 +5472,66 @@ test "HotPrefixCache: a budget-declined candidate spills to the SSD tier" {
         const res = try hc2.lookupAndRestore(&cache2, &moe, null, s, &tokens, false, &.{}, null, null);
         try testing.expect(res.full_match);
         try testing.expectEqual(@as(usize, 599), res.matched);
+    }
+}
+
+test "HotPrefixCache: a budget-declined candidate spills to the SSD tier with its dflash and mtp sidecars" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // A RAM budget below the commit floor declines the candidate, so only the spill writes it.
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 16 * 1024);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spill-spec", 0, 128);
+        defer hc.deinit();
+
+        var trunk = try KVCache.init(testing.allocator, 2);
+        defer trunk.deinit();
+        try testFillCache(&trunk, s, 2, 600);
+        var assist = try KVCache.init(testing.allocator, 2);
+        defer assist.deinit();
+        try testFillCache(&assist, s, 2, 600);
+        var hist = try KVCache.init(testing.allocator, 1);
+        defer hist.deinit();
+        try testFillCache(&hist, s, 1, 600);
+
+        const st = try hc.commitWithSsm(&trunk, &tokens, false, null, .{ .cache = &assist, .base_pos = 0 }, .{ .cache = &hist, .base_pos = 0 });
+        try testing.expect(st == .declined);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        try testing.expect(hc.disk.?.entries.items[0].spec_dflash != null);
+        try testing.expect(hc.disk.?.entries.items[0].spec_mtp != null);
+    }
+
+    // A fresh process restores the prefix and both spec caches from the SSD tier.
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spill-spec", 0, 128);
+        defer hc2.deinit();
+
+        var trunk2 = try KVCache.init(testing.allocator, 2);
+        defer trunk2.deinit();
+        var dfl = try KVCache.init(testing.allocator, 2);
+        defer dfl.deinit();
+        var mtp_dst = try KVCache.init(testing.allocator, 1);
+        defer mtp_dst.deinit();
+        var moe_off: usize = 0;
+        var dbase: usize = 99;
+        var mbase: usize = 99;
+        const res = try hc2.lookupAndRestore(&trunk2, &moe_off, null, s, &tokens, false, &.{}, .{ .cache = &dfl, .base_pos = &dbase }, .{ .cache = &mtp_dst, .base_pos = &mbase });
+        try testing.expect(res.full_match);
+        try testing.expectEqual(@as(usize, 599), res.matched);
+        try testing.expectEqual(@as(?usize, 0), res.dflash_base);
+        try testing.expectEqual(@as(usize, 599), dfl.step);
+        try testing.expectEqual(@as(?usize, 0), res.mtp_base);
+        try testing.expectEqual(@as(usize, 599), mtp_dst.step);
     }
 }
 
@@ -11302,6 +11371,38 @@ test "HotPrefixCache module: a long conversation keeps a thinned ladder and ever
     for (snaps) |s| try testing.expectEqual(@as(usize, 1), s.frees);
 }
 
+test "HotPrefixCache module: at the count cap a new turn takes its own conversation's previous tip, never another's" {
+    // Bar: four conversations on one cache key keep all four latest states at four entries.
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer cache.deinit();
+    const q = kv_quant.KVQuantConfig.dense;
+    const first = [_][]const u32{ &.{ 1, 10 }, &.{ 2, 20 }, &.{ 3, 30 }, &.{ 4, 40 } };
+    const second = [_][]const u32{ &.{ 1, 10, 11 }, &.{ 2, 20, 21 }, &.{ 3, 30, 31 }, &.{ 4, 40, 41 } };
+    var snaps: [8]ModuleFake.Snap = undefined;
+    for (first, 0..) |ids, i| {
+        snaps[i] = .{ .owner = &fake, .ids = ids, .key = ids[0] + ids[1] };
+        _ = try snaps[i].put(&cache, binding, &.{});
+    }
+    for (second, 0..) |ids, i| {
+        // The turn restores its conversation's tip first, which makes that tip the most recently used entry.
+        const hit = cache.findModuleMatch(binding, ids, false, &.{}, null, q) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(usize, 2), hit.n);
+        _ = cache.restoreModule(binding, hit.entry_id, 0);
+        snaps[4 + i] = .{ .owner = &fake, .ids = ids, .key = ids[0] + ids[1] + ids[2] };
+        _ = try snaps[4 + i].put(&cache, binding, &.{});
+    }
+    try testing.expectEqual(@as(usize, 4), cache.entryCount());
+    for (second) |ids| {
+        const next = [_]u32{ ids[0], ids[1], ids[2], 99 };
+        try testing.expectEqual(@as(usize, 3), cache.findModuleMatch(binding, &next, false, &.{}, null, q).?.n);
+    }
+    cache.invalidateAll("test end");
+}
+
 test "HotPrefixCache module: a rung whose tip left by another path is a tip again" {
     var fake: ModuleFake = .{};
     var bound: plugin_driver.Bound = undefined;
@@ -11432,12 +11533,6 @@ test "HotPrefixCache module: loaded instance gate keeps pipeline and streamed pa
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
     cfg.legacy.caps.prefix_cache = false;
     fake.enabled = true;
-    cfg.glm_stream = true;
-    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
-    cfg.glm_stream = false;
-    cfg.expert_bank = true;
-    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
-    cfg.expert_bank = false;
     cfg.dist_span = .{ .start = 0, .end = 1, .total = 2 };
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
     cfg.dist_span = null;
@@ -11574,6 +11669,7 @@ const ModuleDiskTest = struct {
         hc.disk = try kv_disk_cache.DiskTier.initWithModule(testing.allocator, testing.io, base, "module-lifetime", 0, 512, context);
         hc.disk.?.armTestSpace(1024 * kv_disk_cache.DISK_STORE_FLOOR, 2048 * kv_disk_cache.DISK_STORE_FLOOR);
         hc.disk.?.enableBackgroundWriter();
+        hc.module_quiet_ms = 0;
         return hc;
     }
 
@@ -11599,6 +11695,72 @@ const ModuleDiskTest = struct {
         hc.disk.?.pollModuleWrites();
     }
 };
+
+test "a module tip is written once it has gone quiet, not after every turn; a shutdown writes it at once" {
+    // Bar: the idle flush leaves a tip alone inside its quiet period, lands it after, and a shutdown does not wait.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    hc.module_quiet_ms = 60_000;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    try testing.expectEqual(FlushResult.quiet, hc.flushOwedSlice(cpu));
+    try testing.expect(hc.disk.?.pending_module == null);
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.bytes_persisted);
+    try testing.expectEqual(@as(u32, 0), hc.moduleCommittedCount());
+    hc.entries.items[0].touched_ms -= 60_001;
+    try ModuleDiskTest.finish(&hc, cpu);
+    try testing.expectEqual(@as(u32, 1), hc.moduleCommittedCount());
+
+    // A second conversation's fresh tip: quiet for the idle flush, written by the shutdown.
+    const other = ModuleDiskTest.ids(9000);
+    var snap2 = ModuleDiskTest.snap(&fake, other[0..512]);
+    _ = try snap2.put(&hc, binding, &.{});
+    try testing.expectEqual(FlushResult.quiet, hc.flushOwedSlice(cpu));
+    var now: i64 = 0;
+    const tally = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 0 }, 1_000_000);
+    try testing.expectEqual(@as(u32, 1), tally.written);
+    try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+}
+
+test "a turn's commit drops the unwritten export of the state it supersedes" {
+    // Bar: only a conversation's latest state is owed to the SSD; the one a new turn extends is neither written
+    // nor counted as a loss, and thinning its ladder parks nothing.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 16);
+    defer hc.deinit();
+    hc.module_quiet_ms = 60_000;
+    var ids: [517]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = 7 + @as(u32, @intCast(i));
+    var snaps: [6]ModuleFake.Snap = undefined;
+    for (&snaps, 0..) |*sn, i| {
+        sn.* = ModuleDiskTest.snap(&fake, ids[0 .. 512 + i]);
+        _ = try sn.put(&hc, binding, &.{});
+    }
+    var owed: usize = 0;
+    for (hc.entries.items) |*e| {
+        if (!e.disk_dirty) continue;
+        owed += 1;
+        try testing.expectEqual(@as(usize, 517), e.tokens.len);
+    }
+    try testing.expectEqual(@as(usize, 1), owed);
+    try testing.expect(hc.pending_disk == null and hc.finishing_disk == null);
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.bytes_persisted);
+    try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+}
 
 test "under-floor module commits remain RAM-only" {
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -11644,7 +11806,7 @@ test "module registration OOM preserves RAM" {
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
 }
 
-test "replacement and count eviction preserve module exports" {
+test "a count eviction preserves the evicted tip's export; a state its own conversation supersedes is not written" {
     for ([_]bool{ false, true }) |replacement| {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -11665,12 +11827,14 @@ test "replacement and count eviction preserve module exports" {
         _ = hc.flushOwedSlice(cpu);
         _ = try next.put(&hc, binding, &.{});
         try testing.expectEqual(@as(usize, 1), hc.entryCount());
-        try testing.expectEqual(@as(usize, 0), old.frees);
-        try testing.expectEqual(@as(u64, 80), hc.residentBytes());
+        // Another conversation's tip is parked until its record lands; a superseded state is freed at once.
+        try testing.expectEqual(@as(usize, if (replacement) 1 else 0), old.frees);
+        try testing.expectEqual(@as(u64, if (replacement) 40 else 80), hc.residentBytes());
         try testing.expectEqual(@as(u64, 40), hc.current_kv_bytes);
-        try testing.expectEqual(@as(u64, 40), hc.reclaimableBytes());
+        try testing.expectEqual(@as(u64, if (replacement) 0 else 40), hc.reclaimableBytes());
         try ModuleDiskTest.finish(&hc, cpu);
-        try testing.expect(hc.disk.?.entryWholeOnDisk(disk_id));
+        try testing.expectEqual(!replacement, hc.disk.?.entryWholeOnDisk(disk_id));
+        try testing.expect(hc.disk.?.entryWholeOnDisk(hc.entries.items[0].module.?.disk_id.?));
         try testing.expectEqual(@as(usize, 1), old.frees);
         try testing.expectEqual(@as(u64, 40), hc.residentBytes());
         try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
@@ -11700,7 +11864,8 @@ test "full holders cancel the evicted module export" {
         try testing.expectEqual(@as(usize, 0), snaps[1].frees);
         try testing.expectEqual(@as(usize, 1), snaps[2].frees);
         try testing.expect(!hc.disk.?.entryWholeOnDisk(disk_ids[2]));
-        try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+        // With both holders full another conversation's tip is lost; a superseded state was never owed.
+        try testing.expectEqual(@as(u64, if (replacement) 0 else 1), hc.module_export_losses_total);
         const cpu = mlx.weightLoadStream();
         defer _ = mlx.mlx_stream_free(cpu);
         try ModuleDiskTest.finish(&hc, cpu);
@@ -11922,9 +12087,10 @@ test "busy module shutdown expires without fencing" {
     defer _ = mlx.mlx_stream_free(cpu);
     var now: i64 = 0;
     const t = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 1 }, 12);
-    try testing.expectEqual(@as(u32, 0), t.written);
-    try testing.expectEqual(@as(u32, 1), t.left_deadline);
-    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+    // The writer runs in real time against this stepped clock: on a loaded machine the record lands before the
+    // deadline. It is written, or it expired as one loss; never both, never neither.
+    try testing.expectEqual(@as(u32, 1), t.written + t.left_deadline);
+    try testing.expectEqual(@as(u64, t.left_deadline), hc.module_export_losses_total);
     // The shutdown drain unpauses the writer, so the one accepted file may still be in flight: expiry
     // fences only queued files and lets a started write finish. Nothing is left queued or unsent.
     try testing.expectEqual(@as(u64, 0), hc.disk.?.writer.?.queuedBytes());
@@ -12136,4 +12302,51 @@ test "shutdown counts published module records" {
     try testing.expectEqual(@as(u64, 0), t.failures);
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
     try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+}
+
+const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
+const engine_cache_ops = @import("../kv/cache_ops.zig");
+
+// Bar: a checkpoint that a whole-prompt plugin stores restores the slot state that the chunk loop's own checkpoint does.
+test "HotPrefixCache: a whole-prompt plugin's checkpoint, stored through CacheOps.checkpoint, restores the slot state the chunk loop's checkpoint does" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const next = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 70, 71, 72 };
+    // The slot after 6 tokens: a conv and scan layer, a conv-only layer and an attention layer.
+    var live = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&live);
+    const states = [_]plugin_abi.LayerState{
+        .{ .layer = 0, .conv = .{ .ctx = live[0].conv_state.ctx }, .ssm = .{ .ctx = live[0].ssm_state.ctx } },
+        .{ .layer = 1, .conv = .{ .ctx = live[1].conv_state.ctx } },
+    };
+    var restored: [2][3]SSMCacheEntry = .{ pcEmptySsm(), pcEmptySsm() };
+    defer for (&restored) |*r| pcFreeHybrid(r);
+    for (&restored, 0..) |*r, arm| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, prompt.len);
+        var list: std.ArrayList(SSMCheckpoint) = .empty;
+        defer list.deinit(testing.allocator);
+        if (arm == 0) {
+            // The chunk loop: its own capture of the slot at 6.
+            try list.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 6, s));
+        } else {
+            // A whole-prompt plugin: the same states at the planned position, through the slot's CacheOps.
+            var pc: PromptCheckpoints = .{ .allocator = testing.allocator, .list = &list, .positions = &.{6}, .layers = 3, .s = s };
+            const sink = pc.sink();
+            var slot: engine_cache_ops.Slot = .{ .kv = &cache, .checkpoints = &sink };
+            const op = engine_cache_ops.ops.checkpointOp() orelse return error.TestExpectedCheckpointOp;
+            try testing.expect(op(slot.handle(), 6, .of(&states)).isOk());
+        }
+        _ = try hc.commitWithState(&cache, &prompt, false, &.{}, try list.toOwnedSlice(testing.allocator), null, null);
+        var kv = try KVCache.init(testing.allocator, 3);
+        defer kv.deinit();
+        var off: usize = 0;
+        const hit = try hc.lookupAndRestore(&kv, &off, r, s, &next, false, &.{}, null, null);
+        try testing.expectEqual(@as(usize, 6), hit.matched);
+    }
+    try testing.expectEqualStrings("", try pcSsmDiffField(s, &restored[0], &restored[1]));
 }

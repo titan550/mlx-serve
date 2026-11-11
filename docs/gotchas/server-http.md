@@ -21,6 +21,13 @@ was a 400. Fix: empty stops skipped at every parse site; a schema-less `json_sch
 decoded, so never refused); empty embedding entries 400; the handshake answers `done_reason: load` without a forward.
 Guard: `tests/test_api_edges.sh`.
 
+### `logit_bias` answered 200 and changed nothing
+Defect: a -100 `logit_bias` still produced the banned token, on every model. Cause: no handler parsed the field and
+`SamplingParams` had no slot for it, though the llama.cpp, ds4 and Neural Engine adapters serve `Caps.logit_bias`.
+Fix: chat and `/v1/completions` parse it (`parseLogitBias`, bias clamped to +-100) and an engine beside MLX gets it
+as `Sampling.logit_bias`; the MLX samplers do not read it, so `Scheduler.submit` refuses it by name (a 400 naming
+MLX). Guard: `parseLogitBias` and `missingCap` tests, `tests/test_logit_bias.sh`.
+
 ### A bare-string `image_url` vanished from the prompt
 Defect: `{"type":"image_url","image_url":"data:..."}` (the Responses shape) answered 200 about a picture the model
 never saw. Cause: the parser skipped any part whose `image_url` was not an object, and every other malformed shape
@@ -704,6 +711,12 @@ Defect: under `tailscale serve --set-path`, the console fetched root-absolute UR
 Defect: the app loads a GGUF quant by its file path and `probeModelDir` took folders only. Fix: `probeModelDir`
 accepts a `.gguf` file (not sidecars or embedding GGUFs), named by its stem. Guard: `registerByPath takes a .gguf
 file`, `tests/test_llama_gguf.sh` [8].
+
+### Unloaded GGUFs need their own context metadata
+GGUF-only entries have no `config.json`, so a catalog built from config stubs omits their trained window.
+Read `engine_pick.Info.context_length` once per entry and use it for the top-level, meta and agent-budget fields;
+a zero or unavailable GGUF window retains the context from a readable `config.json`.
+Guards: `an unloaded catalog row exposes the trained context`, `tests/test_gguf_context_catalog.sh`.
 
 ### MiniMax-H3 admitted a canvas it could not hold (#764)
 Defect: a 1536x672 x 124f run died in an uncatchable Metal OOM on its first step; every request printed the same peak.

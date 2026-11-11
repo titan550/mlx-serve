@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# The fork's build: the app and server exactly as `bash app/build.sh` makes them, named after the tree
-# (<last release>+fork.<commits since it>, e.g. 26.11.2+fork.8: a plugin's build.zig.zon names the kit as a
-# dependency, so the version must be semver, and `+` metadata is what the app's UpdateChecker ignores, so it
-# neither nags about this build nor offers one; a `-` suffix would sort below the release and nag), then this
-# build's plugin kit staged at ~/.mlx-serve/kit under the same name (what Models > Plugins matches before it
-# would download a release's kit), then every plugin local/plugins.conf pins built against that kit and
-# installed, plugins switched on, and only then the app relaunched, so it comes up with them loaded
-# (local/CHANGE-POLICY.md, F1).
+# The fork's build: the app and server exactly as `bash app/build.sh` makes them, under the version upstream's
+# `scripts/dev-version.sh` names (the newest release tag behind HEAD), then this build's plugin kit staged at
+# ~/.mlx-serve/kit under that same name (what Models > Plugins matches before it would download a release's kit),
+# then every plugin local/plugins.conf pins built against that kit and installed, plugins switched on, and only
+# then the app relaunched, so it comes up with them loaded (local/CHANGE-POLICY.md).
 #   local/build.sh [ko]      the whole thing; ko relaunches the app at the end
 #   local/build.sh plugins   only the kit and the plugins, against the app already built (no relaunch)
 set -euo pipefail
@@ -18,9 +15,9 @@ KIT="$HOME/.mlx-serve/kit"
 SRC="$HOME/.mlx-serve/plugin-src"       # the app's own checkout of CommunityServe/plugins
 ZIG="$ROOT/.zig-toolchain/zig"; [ -x "$ZIG" ] || ZIG=zig
 
-desc="$(git describe --tags --match 'v*' --long)"   # v26.11.2-8-g6ae3b42d
-base="${desc#v}"; base="${base%-g*}"                 # 26.11.2-8
-VERSION="${base%-*}+fork.${base##*-}"                # 26.11.2+fork.8
+# The version the app and its kit share: upstream's own rule (the newest release tag behind HEAD), so a source build
+# reports the release its code is and Models > Plugins finds the kit this script stages under the same name.
+VERSION="$(bash "$ROOT/scripts/dev-version.sh" "$ROOT" "$ROOT/app/Info.plist")"
 
 mode="${1:-}"
 case "$mode" in
@@ -32,8 +29,8 @@ if [ "$mode" != plugins ]; then
   if [ -n "$(git status --porcelain -- src app build.zig build lib)" ]; then
     echo "[fork-build] note: uncommitted changes under src/ app/ build/ lib/; $VERSION names HEAD, not this tree" >&2
   fi
-  echo "[fork-build] version $VERSION ($desc)"
-  MLX_SERVE_DEV_VERSION="$VERSION" bash app/build.sh
+  echo "[fork-build] version $VERSION"
+  bash app/build.sh
 else
   # The kit must carry the version the built app reports, which is what Models > Plugins matches.
   built="$("$BIN" --version 2>/dev/null | sed -n 's/^mlx-serve \([^ ]*\).*/\1/p')"

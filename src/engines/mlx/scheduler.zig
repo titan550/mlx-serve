@@ -70,7 +70,6 @@ const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const status = @import("../../host/status.zig");
 const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = @import("modules/stream.zig");
 const sleep_inhibit = @import("runtime/sleep_inhibit.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -140,6 +139,7 @@ const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
 const pleTableBill = @import("runtime/preflight.zig").pleTableBill;
 const residentModelDiskBytes = @import("runtime/preflight.zig").residentModelDiskBytes;
 const residentGateBytes = @import("runtime/preflight.zig").residentGateBytes;
+const ggufGateBytes = @import("runtime/preflight.zig").ggufGateBytes;
 pub const loadRequirementBytes = @import("runtime/preflight.zig").loadRequirementBytes;
 
 test {
@@ -511,6 +511,10 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
         refusal.refused().* = .{ .kind = e.kind, .cap = cap };
         return error.EngineUnsupported;
     };
+    if (params.model.engine == null and params.sampling.logit_bias.len > 0) {
+        refusal.refused().* = .{ .kind = .mlx, .cap = "logit_bias" };
+        return error.EngineUnsupported;
+    }
     // Every decode path reads the prompt's last token; `""` on a BOS-less vocab encodes to none.
     if (params.prompt_ids.len == 0) return error.EmptyPrompt;
     const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
@@ -520,7 +524,10 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     self.queue_mu.lockUncancelable(self.io);
     defer self.queue_mu.unlock(self.io);
 
+    var blocked: Blocked = .{};
+    defer blocked.leave(&self.submit_waiting);
     while (self.in_flight >= self.queue_cap and !self.shutdown.load(.acquire)) {
+        blocked.enter(&self.submit_waiting);
         self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
     }
     if (self.shutdown.load(.acquire)) return error.Shutdown;
@@ -530,6 +537,7 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     // then claim it (released in `complete`).
     if (params.model.sessionCapacity()) |cap| {
         while (params.model.session_claims >= cap and !self.shutdown.load(.acquire)) {
+            blocked.enter(&self.submit_waiting);
             self.session_cond.waitUncancelable(self.io, &self.queue_mu);
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
@@ -562,6 +570,39 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     self.in_flight += 1;
     self.queue_cond.broadcast(self.io);
     return slot;
+}
+
+/// One `submit` call's share of `submit_waiting`: counted at its first wait, however many waits follow, and given
+/// back when the call returns.
+const Blocked = struct {
+    counted: bool = false,
+
+    fn enter(self: *Blocked, waiting: *u32) void {
+        if (self.counted) return;
+        self.counted = true;
+        waiting.* += 1;
+    }
+
+    fn leave(self: *Blocked, waiting: *u32) void {
+        if (self.counted) waiting.* -= 1;
+    }
+};
+
+test "a submit blocked for queue room and then for a session counts as one waiting request until it returns" {
+    var waiting: u32 = 0;
+    var a: Blocked = .{};
+    a.enter(&waiting);
+    a.enter(&waiting);
+    var b: Blocked = .{};
+    b.enter(&waiting);
+    try std.testing.expectEqual(@as(u32, 2), waiting);
+    a.leave(&waiting);
+    try std.testing.expectEqual(@as(u32, 1), waiting);
+    // A call that never waited gives nothing back.
+    var c: Blocked = .{};
+    c.leave(&waiting);
+    b.leave(&waiting);
+    try std.testing.expectEqual(@as(u32, 0), waiting);
 }
 
 /// Give back the slot's session claim. Caller holds `queue_mu`.
@@ -800,7 +841,8 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
     // Peeked OUTSIDE the registry mutex — it stats the model dir, and no
     // other load should block on our filesystem.
     const media_peak = mediaPeakFor(self, entry);
-    const mlx_text = owned.gguf == null and gen_mod.modalityFromType(owned.config.model_type) == null;
+    const mlx_text = owned.gguf == null and gen_mod.modalityFromType(owned.config.model_type) == null and
+        !@import("../../host/plugins/loader.zig").engineServes(entry.path);
     const validated_model_bytes: ?u64 = if (mlx_text)
         residentModelDiskBytes(self.allocator, self.io, entry.path, owned.config) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
@@ -810,7 +852,8 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         }
     else
         null;
-    const resident_model_bytes = residentGateBytes(validated_model_bytes, entry.bytes_on_disk, mlx_text);
+    const discovered_bytes = if (owned.gguf) |g| ggufGateBytes(entry.bytes_on_disk, g.disk_only_bytes) else entry.bytes_on_disk;
+    const resident_model_bytes = residentGateBytes(validated_model_bytes, discovered_bytes, mlx_text);
     // A Neural Engine load holds int8 copies of the pack's 4- to 8-bit weights, and its KV.
     const ane_bytes: ?u64 = if (mlx_text and engines_served.aneWanted(owned.config, self.ane))
         engines_load.aneBytes(self.allocator, entry.path, self.ane_slots)
@@ -844,9 +887,6 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
             }
         }
 
-        // One stream pack at a time reads the process's foreign-bytes value (DeepSeek-V4.1, GLM-5.3).
-        const foreign_reader = try self.registry.foreignReaderVictimLocked(entry.id, owned.config);
-
         // Claim the slot.
         std.debug.assert(self.registry.tryBeginLoadLocked(entry));
         // From the claim: while victims unload or the queue waits, not the last load's numbers.
@@ -870,7 +910,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         // (multi-victim). On failure — every other resident model is pinned
         // by an in-flight request — roll back and surface a 503 instead of
         // loading anyway and crashing.
-        const n = self.registry.planEvictionsLocked(entry.id, foreign_reader, &victims_buf, mlxActiveBytes()) orelse {
+        const n = self.registry.planEvictionsLocked(entry.id, &victims_buf, mlxActiveBytes()) orelse {
             // Name the numbers. A refusal that logs NOTHING sends the user
             // hunting for a concurrent request that does not exist: on an
             // idle server the cause is always the static cap (#126), and

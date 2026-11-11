@@ -7,6 +7,13 @@ decided: the measured default stays, the losing opt-in was deleted. Engine code 
 (`spec/`, `cache/`, `kv/`, `sampling/`, `generate/`), shared blocks and kernels under `src/sdk/blocks/` and
 `src/kernels/`.
 
+### ds4's disk-only tails are not resident weights
+Qwen's BF16 n-grams and V4.1's encoded Engram rows live outside ds4's weight mapping. Billing the full file can
+refuse a model whose mapped weights and session fit. Deduct their tensor bytes only after the header's encoding,
+types, shapes, offsets, page alignment and file bounds satisfy the pinned native unmapping rules. Carry that
+count through ds4 routes, the load gate and adapter estimates; llama routes retain the full bill.
+Guards: `GGUF accounting` tests in the reader, CPU route, preflight and ds4 adapter.
+
 ## Sampling
 
 ### `top_p: 0` masked every token and sampled uniform garbage
@@ -56,6 +63,33 @@ Defect: a "hi" chat matching only an 80k session's system prompt kept 80k of cap
 then evicted the long session. Cause: a restored cache shares the donor's buffer and the first append copied all of
 it. Fix: `KVCache.restoredOversized` regrows from the prefix when the donor is much larger; evict-to-admit is no
 longer qwen4-only. Guard: `KVCache: an append after a short restore sizes its copy from the prefix`.
+
+### A prompt was refused right after the eviction that made room for it (#987)
+Defect: an agent turn got "does not fit in GPU memory even after freeing the prefix cache" although the pass had
+just evicted more than it needed (4204 MB freed, the re-check still read 4607 MB against a 5066 MB bill); a retry
+went through. Cause: with the buffer pool at its cap an evicted entry goes back to the OS, and macOS shows returned
+memory about a second late (a freed 4 GiB read unchanged at once, a third at 200 ms, all of it by 1.2 s) while a new
+allocation takes it at once. Fix: `system.ReturnLag` credits what MLX returned between two close readings until the OS
+figure shows it or MLX takes it again; `getAvailableMemBytes` adds it, so admission, the load preflight and `/props`
+read one figure. Guard: `ReturnLag` test, `getAvailableMemBytes counts memory MLX has just returned`.
+
+### Conversations sharing a cache key evicted each other's latest state (#1125)
+Defect: four DeepSeek-V4.1 conversations with one system prompt (an agent and its subagents, no `prompt_cache_key`)
+at `--prefix-cache-entries 4` re-prefilled most turns: 0 to 27% token reuse against 89 to 97% with a key each.
+Cause: `commitModule` makes room before it appends the new tip, so the conversation's previous tip was not a rung
+yet (`isModuleRung` looks for a longer RESIDENT entry) and, just restored, it was the most recently used; the LRU
+pass took another conversation's tip. Fix: `incoming_tip` names the commit in progress and `isModuleRung` counts
+what it extends. Guard: `at the count cap a new turn takes its own conversation's previous tip, never another's`.
+
+### Every DeepSeek-V4.1 turn rewrote the conversation's whole state to the SSD (#1124)
+Defect: macOS flagged mlx-serve for 550 GB of disk writes in 18 hours of agent use; the 20 GB tier turned over 27
+times and 7,826 superseded records were written and deleted. Cause: a module record is immutable, each commit
+registered a new one, and the idle loop flushed it in the seconds before the next turn; the state that turn then
+superseded was parked and written as well. Fix: the idle flush leaves a module tip alone until it has gone
+`module_quiet_ms` (60 s) without a turn (`FlushResult.quiet`, a one-second re-check), eviction and shutdown still
+write it, and a commit cancels the unwritten export of what it extends or replaces (`superseded`, not a loss). A
+crash loses the cached state of a conversation that never paused: it prefills once. Guard: `a module tip is written
+once it has gone quiet`, `a turn's commit drops the unwritten export of the state it supersedes`.
 
 ### A warm turn that could not share its prefix was refused (PR #518)
 Defect: a 46k-of-47.7k-warm agent turn on a 64 GB Mac got `PrefillDoesNotFit`. Cause: off SSD-first a restore shares
@@ -1396,3 +1430,39 @@ Cause: the adapter hands ds4 any `-DSpark-`/`-MTP-` GGUF in the model's folder, 
 support GGUF (and `--dspark`) for the V4.1 family. Fix: `engine_pick.ds4Spec` says which archs take one; the adapter
 logs and skips the file for the rest (`--mlx-gguf` still drafts with it). Guard: `open: a support GGUF beside the
 model reaches ds4 only for an arch that takes one` + `ds4Spec: DeepSeek-V4.1 takes no support GGUF in ds4`.
+
+### A DeepSeek-V4.1 pack whose vision tower the build cannot read failed the whole load
+Defect: the EXL3 repack (its tower EXL3 too) died at boot with `EngineFailed` instead of serving text with vision off.
+Cause: under `-Dunits` (the macOS default) the tower init runs in the module archs' unit and its error crosses by name;
+`MissingVisionWeights` was not in `err_name.Known`, so `load.zig`'s benign opt-out never matched. Fix: the name joined
+`Known`. Guard: the `err_name` test; an error a caller compares after a cross-unit call must be in `Known`.
+
+### A short prompt on DeepSeek-V4.1's streamed EXL3 bank failed the request
+Defect: a 12-token prompt ("Name three primary colors") 500'd with `PluginForwardFailed`; 8 and 18 tokens served.
+Cause: `extendIds` picked the bank's prompt phase only past the 16 decode-region rows, but a decode-phase call holds
+48 routed ids (8 rows at top-6); 9-16 rows went wide in the decode phase and the stream refused `NotPrefill`. The
+module unit's error crossed as `EngineFailed`, and the forward logged no name. Fix: `promptPhase` (rows or routed
+ids), and the forward logs its error by name. Guard: `dsv41 streamed phase` + `tests/test_dsv41.sh` [4].
+
+### `WeightHooks.keep_key` is all-or-nothing: the engine loads every tensor or none
+Defect: a plugin's `keep_key` that left the embedding and the vision tower on disk freed nothing: the server still held
+2.4 GB more than the old plugin, and the streamed bank got fewer slot rows. Cause: the driver asks the hook only
+whether the table keeps ANY tensor (`keepsAny`); a keep means the whole pack loads. Fix: deepseek_v41 drops what it does
+not read after `init` (the embedding behind its pread, an outside plugin's tower, the stacked `wo_a` slices) and clears
+MLX's cache before the bank reads the memory in use. Guard: the `slot rows per layer` load line against the old plugin.
+
+### DeepSeek-V4.1's settings set at load reached only one of its three units
+Defect: under `-Dunits` the ported prompt-pass and streamer modules kept their settings and per-prompt regions in
+plain globals; the plugin unit's load set them, and the modules unit (DSpark rounds, the streamer) ran on its own
+defaults. Fix: every such global is one `Shared` per file (`ps()`), listed through `shared_all.zig`. Guard:
+`zig build units-check -Dunits=true` (it listed 55).
+
+### `stream_experts` under-billed every MoE whose plugin did not stream
+Defect: the setting on a qwen3_moe or Hy3 pack billed the residents plus slot rows, while the plugin, which never read
+it, loaded every expert. Cause: the preflight swapped expert bytes for slot rows on the setting alone; only qwen3_5 and
+deepseek_v41 opened a stream, each with its own copy of the open and bind code. Fix: `Caps.experts_stream` (the
+preflight refuses the setting without it) and two SDK calls every MoE on the shared block uses (`Streamed.forLoad`,
+`moe.bindStreamed`). The suite's check also caught a CPU stream serving rows before their reads landed (wrong logits,
+no error): `openPack` takes GPU streams only. Guard: `residentModelDiskBytes: with stream_experts ...`, the
+conformance suite's streamed check, `mlx pack: a pack opened on a CPU stream is refused by name`.
+

@@ -39,11 +39,6 @@ private let supportedArchitectureTagPrefixes: [String] = [
 /// model_type values from config.json that the Zig server can load.
 /// MLX-format DeepSeek-V4 is intentionally NOT in this set — DSV4 is served
 /// by the embedded ds4 engine, which loads the GGUF checkpoint directly.
-/// Served model types the Hugging Face search does not offer: the server loads them only
-/// from an mlx-stream pack (the trunk beside an `experts.bin` bank), and an ordinary
-/// checkpoint with the same model_type does not load. A local pack still lists and picks.
-let streamOnlyModelTypes: Set<String> = ["glm_moe_dsa"]
-
 let supportedModelTypes: Set<String> = [
     "gemma3", "gemma3_text", "gemma4", "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
@@ -62,7 +57,6 @@ let supportedModelTypes: Set<String> = [
     "flint", // Recursive Flint (39.8B-A2.5B MoE coder)
     "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text + vision)
-    "glm_moe_dsa", // Z.ai GLM-5.3 (744B MoE): an mlx-stream pack (the trunk beside an experts.bin bank)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
@@ -78,7 +72,7 @@ let supportedModelTypes: Set<String> = [
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
     "gguf", "deepseek_v4",
-    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/plugins/deepseek_v41/deepseek_v41.zig), the EXL3 repack on mlx-stream
+    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/plugins/deepseek_v41/deepseek_v41.zig), the EXL3 repack through the turboexl3_ds41 plugin
     "gpt_oss",
 ]
 
@@ -105,8 +99,8 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // `MediaModalityParityTests` reads every media plugin's `model_types` out of src/plugins/*/config.zig and
 // asserts this agrees; the server's own discovery and dispatch read those plugins.
 private let mediaModelTypeExactValues: Set<String> = [
-    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
-    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d", "idol",
+    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_h3_image", "minimax_music3", "kokoro", "mageflow",
+    "laya", "kev", "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d", "idol",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -169,7 +163,7 @@ enum MediaModality: CaseIterable {
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
-            || modelType.hasPrefix("qwen_image") || modelType == "moss_image" { self = .image; return }
+            || modelType.hasPrefix("qwen_image") || modelType == "moss_image" || modelType == "minimax_h3_image" { self = .image; return }
         if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" || modelType == "idol" { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
@@ -332,7 +326,7 @@ struct HFModel: Identifiable, Codable {
         // HF tags every repo with its config.json model_type, so a served
         // model_type counts verbatim, no family prefix needed.
         return tags.contains { tag in
-            (supportedModelTypes.contains(tag) && !streamOnlyModelTypes.contains(tag))
+            supportedModelTypes.contains(tag)
                 || supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
         }
     }

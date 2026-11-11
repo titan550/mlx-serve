@@ -19,26 +19,16 @@ files): run `git diff --numstat origin/main fork-main` filtered to files on `ori
 whole delta is +1671/−359 over 52 upstream files, all of it in entries with PRs intended, so the fork-only
 count is `dev-build-version`'s 2 lines.
 
-### dev-build-version — a dev build names itself (`MLX_SERVE_DEV_VERSION`) and stages its own plugin kit
-- Level: L3 + L4          Status: active (2026-11-06)
-- Why: `app/build.sh`'s no-`gh` arm reads the tracked plist, which says the last release upstream stamped
-  there (26.11.1 even on the v26.11.2 tag). The app matches a plugin kit by that string, so a fork build
-  installs plugins against the 26.11.1 release kit (another MLX pin): refused as stale, Rebuild all fetches
-  the same kit again.
-- Branch: `fork/dev-version` (the 2 lines), `fork/local` (`local/build.sh`)       Files touched:
-  `app/build.sh`       Upstream-file lines: +2/−0
-- Conflict points: the CalVer block of `app/build.sh`; `tests/test_release_workflow_gates.sh` pins that
-  block's shape (window of 14 lines before `gh release list`; the PlistBuddy read line verbatim).
-- Off switch: unset `MLX_SERVE_DEV_VERSION` (the arm is byte-identical then).
-- Tests: `tests/test_release_workflow_gates.sh` (passes unchanged).
-- Upstream: yes, later ("a dev build may name its version"); the better upstream shape is the app offering
-  a dev build's own kit, which needs no env var.       If declined: carry (2 lines).
-- Drop when: upstream's Install flow uses `zig-out/kit` or `~/.mlx-serve/kit` for a non-release version.
-- Notes: version is `<tag>+fork.<commits since tag>` (e.g. `26.11.2+fork.12`). It must be semver: a plugin's
-  `build.zig.zon` names the kit as a dependency and Zig refused `26.11.2.12` (first install attempt,
-  2026-11-07). `+` metadata is what UpdateChecker ignores: no nag about this build, and no update offers
-  either; the fork adopts releases by hand (CHANGE-POLICY §6). A `-` suffix would sort below the release
-  and nag forever.
+### dev-build-version — SUPERSEDED upstream, our patch dropped
+- Level: L3          Status: **dropped 2026-11-10** (upstream `scripts/dev-version.sh`)
+- Why it existed: `app/build.sh`'s no-`gh` arm read the tracked plist (26.11.1 even on the v26.11.2 tag), and the app
+  matches a plugin kit by that string, so a fork build installed plugins against the wrong release's kit.
+- Superseded by: upstream's `scripts/dev-version.sh` (with `tests/test_dev_version.sh`), "the newest release tag
+  behind HEAD, so the engine and the plugin kit the app fetches for it match the source". The merge into
+  `origin/main` took upstream's block and dropped our two lines.
+- What stays ours: `local/build.sh` stages the kit under the same version (`scripts/dev-version.sh`), installs the
+  plugins `local/plugins.conf` pins, and relaunches last — fork-only, no upstream file.
+- Upstream-file lines: 0.
 
 ### qwen4-exp-ablation — qwen4_exp serves directional ablation (`Caps.ablation`)
 - Level: L5          Status: active, PR pending the owner's review
