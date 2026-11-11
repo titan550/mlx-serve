@@ -183,12 +183,11 @@ count is `dev-build-version`'s 2 lines.
   2026-11-06. Details in `local/notes/roadmap-2026-11-06.md` step 1. Pinned in `local/plugins.conf` at
   `00f9bec` (2026-11-07; the delta from `59473a90` is `plugin.json` title/homepage/icon metadata and an
   `icon.png`, no code). Installed by `local/build.sh plugins` 2026-11-07, sha256 `4804d9cd…`.
-- `sushi_ds41` @ CommunityServe/plugins `e09865e` (2026-11-09): single-direction ablation; the per-layer bank
-  is reverted (measured worse, `ablation-profile-name`) and kept on branch `feature/per-layer-bank` in the plugin checkout. The
-  strength cap follows the host's `max_strength` (30). Superseded text of the bank entry follows. The forward's
-  ablation now carries the profile's directory name (a new `name` field on the fork's `abi.Ablation`,
-  threaded host→engine→plugin), so the plugin loads that profile's per-layer `bank.f32` (one direction per
-  capture site) instead of projecting one shared direction at every site; a profile with no bank file falls
-  back to the shared direction broadcast to all sites, so the same plugin serves both arms. Banks are keyed
-  by name, loaded once, cached on the model, freed in `Model.deinit`. Plugin files: `ablation.zig`,
-  `ablation_test.zig`, `sushi/dsv41/dsv41_model.zig`. Depends on the fork's ABI `name` field (below).
+- `sushi_ds41` @ `titan550/mlx-serve-plugins` `50a3482` (2026-11-10), a fork of CommunityServe/plugins: one
+  commit, "ablation strength above 1, up to mlx-serve's cap" (accept 0..30; test at 4 and 31). Upstream `main`
+  moved to `cfc3704` since the review and its `KIT_VERSION` is 26.11.3 while mlx-serve's newest tag is
+  v26.11.2, so it was built here against our 26.11.2 kit. The dropped per-layer bank (measured worse, see
+  `ablation-profile-name`) is preserved on the same fork as `feature/per-layer-bank`.
+  Local layout: bare `~/workplace/local-ai/mlx-serve-plugins.git` (origin = the fork, upstream =
+  CommunityServe/plugins), main worktree `~/workplace/local-ai/mlx-serve-plugins`, and `~/.mlx-serve/plugin-src`
+  is a symlink to that worktree. Installed sha256 `b73e2cd6…`.

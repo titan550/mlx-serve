@@ -49,7 +49,8 @@ echo "[fork-build] kit $VERSION staged at $KIT"
 # pointed at ours (fetch-zig downloads otherwise), then the repo's build (the plugin's tests, ReleaseFast) and
 # this app's `plugin install` (hash + signature receipt), which is what Models > Plugins runs.
 if [ -f local/plugins.conf ]; then
-  [ -d "$SRC/.git" ] || git clone -q https://github.com/CommunityServe/plugins.git "$SRC"
+  # a worktree's `.git` is a file, so -e, not -d
+  [ -e "$SRC/.git" ] || git clone -q https://github.com/CommunityServe/plugins.git "$SRC"
   while read -r name sha _; do
     case "$name" in ""|\#*) continue ;; esac
     echo "── plugin $name @ $sha"
