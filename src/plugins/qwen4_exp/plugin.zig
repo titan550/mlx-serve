@@ -25,6 +25,8 @@ const toModelConfig = @import("model_config.zig").toModelConfig;
 const trunk_load = @import("trunk_load.zig");
 const distributed = @import("../../engines/mlx/cluster/distributed.zig");
 const lmHeadMxfp8On = @import("../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
+const Ablation = @import("ablate.zig").Ablation;
+const servesAcross = @import("ablate.zig").servesAcross;
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -263,6 +265,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const slots = @max(f.positions.len, 1);
     if (f.mode != .batched_rows and slots != 1) return Verdict.refuse(.unsupported, "qwen4_exp: one slot's rows at a time outside batched rows");
     if (f.ids.ctx == null) for (f.tokens.slice()) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "qwen4_exp: token id past the vocabulary");
+    if (f.ablation != null and !servesAcross(m.trunk.dist_peer != null, m.trunk.dist_tp != null)) return Verdict.refuse(.unsupported, "qwen4_exp: directional ablation does not run across a Thunderbolt pair");
     const r = if (f.mode == .batched_rows) runBatched(m, f, out) else runOne(m, f, out);
     r catch |e| {
         // The verdict text is static; the cause is only named here.
@@ -340,6 +343,10 @@ fn runOne(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
         r.arms.add(ctx.qsa_arms);
     }
     try m.trunk.ssmGroupRelease(&ctx);
+    var abl = try Ablation.fromForward(f);
+    defer if (abl) |*a| a.deinit();
+    m.trunk.ablation = if (abl) |*a| a else null;
+    defer m.trunk.ablation = null;
     const res = m.trunk.forwardQwen4With(&ctx, ids) catch |e| {
         ple.discardDeferredPle(&m.trunk, &ctx);
         return e;
@@ -394,8 +401,12 @@ fn runBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     defer for (hidden[0..made_hidden]) |h| {
         _ = mlx.mlx_array_free(h);
     };
+    var abl = try Ablation.fromForward(f);
+    defer if (abl) |*a| a.deinit();
     // The legacy tick's PLE gather defers inside it and settles once, before it returns: nothing is left owed.
     if (n > 1 and m.trunk.batchedGdnReady(ptrs[0..n])) {
+        m.trunk.ablation = if (abl) |*a| a else null;
+        defer m.trunk.ablation = null;
         var hrows: ?[]Array = null;
         const got = try m.trunk.forwardMoeBatchedDecode(f.tokens.slice(), ptrs[0..n], cpos[0..n], if (f.want_hidden) &hrows else null);
         defer gpa.free(got);
@@ -416,6 +427,11 @@ fn runBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
             made_hidden += 1;
             ptrs[i].capture_hidden = &hidden[i];
         }
+        // Each slot alone: its own row of the table, none at strength 0.
+        var one: ?Ablation = if (abl != null and f.ablation.?.strengths.slice()[i] != 0) try abl.?.slot(m.trunk.s, i) else null;
+        defer if (one) |*a| a.deinit();
+        m.trunk.ablation = if (one) |*a| a else null;
+        defer m.trunk.ablation = null;
         rows[i] = try m.trunk.forwardQwen4With(ptrs[i], ids);
         made += 1;
     }
@@ -455,6 +471,10 @@ fn runBatchedVerify(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !voi
     defer _ = mlx.mlx_array_free(last);
     var all = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(all);
+    var abl = try Ablation.fromForward(f);
+    defer if (abl) |*a| a.deinit();
+    m.trunk.ablation = if (abl) |*a| a else null;
+    defer m.trunk.ablation = null;
     const logits = try m.trunk.forwardMoeBatchedVerify(.{ .ctx = f.ids.ctx }, ptrs[0..n], cpos[0..n], &last, &all);
     defer _ = mlx.mlx_array_free(logits);
     for (0..n) |i| {
@@ -595,6 +615,7 @@ test {
     _ = @import("oracle_test.zig");
     _ = @import("cost_profile.zig");
     _ = @import("trunk.zig");
+    _ = @import("ablate.zig");
 }
 
 test "qwen4_exp batched forward: an M-RoPE slot runs at its cache position, its delta left to the rope" {
