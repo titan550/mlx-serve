@@ -79,8 +79,6 @@ pub const Slot = struct {
     /// module-owned cache keys its entries by it, the KV prefix cache is neither read nor written. 0 for a `shared`
     /// ablation (`ablation.Prefix`), which reads and writes the one cache.
     cache_variant: u64 = 0,
-    /// A `read` ablation restores unablated KV prefix-cache entries, by copy, and commits none.
-    reads_base_prefix: bool = false,
     /// Set while the slot is prefilled at another prefill's chunk boundary: the most uncached tokens it
     /// may forward there. A restore that covers less than the pre-filter peeked hands the request back.
     boundary_max_tail: ?usize = null,
@@ -381,7 +379,6 @@ pub const Slot = struct {
             .prompt_logprobs_buf = .empty,
             .skip_prefix_cache = params.prompt_logprobs,
             .cache_variant = cacheVariant(params.ablation),
-            .reads_base_prefix = if (params.ablation) |a| a.prefix == .read else false,
         };
 
         // ForwardCtx points at fields owned by `slot` — must outlive the
@@ -741,7 +738,7 @@ pub fn cacheVariant(ablation: ?AblationRequest) u64 {
 test "slot: an ablated request keys the prefix cache by its ablation unless it shares the one cache" {
     const dir = [_]f32{ 1, 0 };
     try std.testing.expectEqual(@as(u64, 0), cacheVariant(null));
-    inline for (.{ .{ .isolated, 9 }, .{ .read, 9 }, .{ .shared, 0 } }) |c| {
+    inline for (.{ .{ .isolated, 9 }, .{ .shared, 0 } }) |c| {
         const r: AblationRequest = .{ .direction = &dir, .strength = 1, .key = 9, .prefix = c[0] };
         try std.testing.expectEqual(@as(u64, c[1]), cacheVariant(r));
     }

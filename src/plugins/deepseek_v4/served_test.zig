@@ -326,10 +326,8 @@ test "served: an ablated request shares a KV prefix cache as its prefix_cache sa
     try testing.expectEqual(@as(u32, 0), try Run.go(h, &a, null, dir));
     const next_a = try Run.nextTurn(aa, pc, &a);
     const kept: u32 = @intCast(next_a.len - 1);
-    // isolated: no restore, no commit; read: restores by copy and commits nothing, so a plain turn still restores.
+    // isolated: no restore, no commit, so the plain turn after it still restores the entry it left alone.
     try testing.expectEqual(@as(u32, 0), try Run.go(h, next_a, .isolated, dir));
-    try testing.expectEqual(@as(usize, 1), pc.entries.items.len);
-    try testing.expectEqual(kept, try Run.go(h, next_a, .read, dir));
     try testing.expectEqual(@as(usize, 1), pc.entries.items.len);
     try testing.expectEqual(kept, try Run.go(h, next_a, null, dir));
     // shared: commits under the plain key, which the plain turn after it restores.
