@@ -183,11 +183,11 @@ count is `dev-build-version`'s 2 lines.
   2026-11-06. Details in `local/notes/roadmap-2026-11-06.md` step 1. Pinned in `local/plugins.conf` at
   `00f9bec` (2026-11-07; the delta from `59473a90` is `plugin.json` title/homepage/icon metadata and an
   `icon.png`, no code). Installed by `local/build.sh plugins` 2026-11-07, sha256 `4804d9cd…`.
-- `sushi_ds41` @ `titan550/mlx-serve-plugins` `50a3482` (2026-11-10), a fork of CommunityServe/plugins: one
-  commit, "ablation strength above 1, up to mlx-serve's cap" (accept 0..30; test at 4 and 31). Upstream `main`
+- `sushi_ds41` @ `titan550/mlx-serve-plugins` `2ca59b4` (2026-11-10), a fork of CommunityServe/plugins: one
+  commit, "take an ablation strength above 1, up to mlx-serve's cap" (accept 0..30; test at 4 and at cap+1). Upstream `main`
   moved to `cfc3704` since the review and its `KIT_VERSION` is 26.11.3 while mlx-serve's newest tag is
   v26.11.2, so it was built here against our 26.11.2 kit. The dropped per-layer bank (measured worse, see
   `ablation-profile-name`) is preserved on the same fork as `feature/per-layer-bank`.
   Local layout: `~/workplace/local-ai/mlx-serve-plugins/` holds `.bare` (origin = the fork, upstream =
   CommunityServe/plugins) and `wt/` for its worktrees — `wt/main` (the build checkout, `~/.mlx-serve/plugin-src`
-  symlinks here) and `wt/sushi-ds41-ablation-strength` (the PR). Installed sha256 `c7240cd9…`.
+  symlinks here) and `wt/sushi-ds41-ablation-strength` (the PR). Installed sha256 `61a947d5…`.
