@@ -90,3 +90,55 @@ final class LocalMtpHeadProbeTests: XCTestCase {
         }
     }
 }
+
+/// The menu bar writes `ablation` while Model Settings is open: the sheet's
+/// save keeps the file's current value unless the sheet itself changed it.
+final class ModelSettingsAblationMergeTests: XCTestCase {
+    private let on = AblationSetting(profile: "p", strength: 1, prefixCache: "shared")
+
+    func testASheetSaveKeepsAMenuBarEditMadeWhileItWasOpen() throws {
+        let path = NSTemporaryDirectory() + "ablation-merge-\(UUID().uuidString)/model-settings.json"
+        var file = ModelSettingsFile()
+        var start = ModelOverride(ctxSize: 8192)
+        start.ablation = on
+        file.set(start, for: "/m/a")
+        try file.save(path: path)
+
+        let initial = try XCTUnwrap(ModelSettingsFile.load(path: path).override(for: "/m/a"))
+        var edited = initial
+        edited.ctxSize = 16_384
+
+        var menuBar = ModelSettingsFile.load(path: path)
+        menuBar.setAblation(AblationSetting(profile: "p", strength: 0, prefixCache: "shared"), for: "/m/a")
+        try menuBar.save(path: path)
+
+        var onSave = ModelSettingsFile.load(path: path)
+        onSave.set(ModelSettingsApply.entryToSave(edited: edited, initial: initial, onDisk: onSave.override(for: "/m/a")),
+                   for: "/m/a")
+        try onSave.save(path: path)
+        let saved = ModelSettingsFile.load(path: path).override(for: "/m/a")
+        XCTAssertEqual(saved?.ctxSize, 16_384)
+        XCTAssertEqual(saved?.ablation?.strength, 0, "the sheet reverted the menu bar's edit")
+    }
+
+    func testTheSheetsOwnAblationEditWins() {
+        var initial = ModelOverride()
+        initial.ablation = on
+        var edited = initial
+        edited.ablation = AblationSetting(profile: "q", strength: 0.5, prefixCache: "isolated")
+        var onDisk = initial
+        onDisk.ablation?.strength = 0
+        XCTAssertEqual(ModelSettingsApply.entryToSave(edited: edited, initial: initial, onDisk: onDisk).ablation,
+                       edited.ablation)
+    }
+
+    func testAMenuBarRemovalStaysRemoved() {
+        let initial = ModelOverride(json: ["ctx_size": 8192, "ablation": ["profile": "p", "strength": 2]])
+        var edited = initial
+        edited.ctxSize = 4096
+        let saved = ModelSettingsApply.entryToSave(edited: edited, initial: initial, onDisk: ModelOverride(ctxSize: 8192))
+        XCTAssertNil(saved.ablation)
+        XCTAssertNil(saved.extra["ablation"], "an unreadable value removed meanwhile came back")
+        XCTAssertEqual(saved.ctxSize, 4096)
+    }
+}

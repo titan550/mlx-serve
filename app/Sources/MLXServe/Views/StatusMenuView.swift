@@ -801,7 +801,21 @@ struct StatusMenuView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
+            // Its own line, and only on the row /props describes.
+            if info.slotKind == .chat, info.name == server.residentChatModel?.name,
+               AblationControl(profiles: info.ablationProfiles, setting: nil, status: server.ablationStatus,
+                               modelId: info.name).isVisible {
+                AblationMenuBarControl(modelPath: settingsPath(of: info), modelId: info.name,
+                                    profiles: info.ablationProfiles, status: server.ablationStatus)
+                    .padding(.leading, 22)
+            }
         }
+    }
+
+    /// The `model-settings.json` key of a resident row: the picked model, the launch model, then the library.
+    private func settingsPath(of info: ModelInfo) -> String? {
+        AblationControl.modelPath(for: info, candidates: [appState.selectedModelPath, server.currentModelPath]
+                                      + appState.localModels.map(\.path))
     }
 
     /// Eject a resident model. The server marks the entry evicting, waits for
