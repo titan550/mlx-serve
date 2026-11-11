@@ -1,5 +1,8 @@
 import SwiftUI
 
+/// The menu bar's help and the sheet's note say the same thing: one sentence, localized by its literal.
+private let ablationAppliesNote: LocalizedStringKey = "Applies to every request to this model, from any app. Profiles in ~/.mlx-serve/ablation load when the server starts."
+
 /// The menu bar's Ablation control on the resident chat model's row: one capsule (switch, a profile menu holding the
 /// cache toggle, strength) and the server's sentence when the setting cannot run. An edit writes only the model's
 /// `ablation` key, which the server applies from the next request.
@@ -78,7 +81,7 @@ struct AblationMenuBarControl: View {
         .foregroundStyle(c.isOn ? Color.orange : Color.secondary)
         .background((c.isOn ? Color.orange : Color.secondary).opacity(0.15))
         .clipShape(Capsule())
-        .help("Applies to every request to this model, from any app. Profiles in ~/.mlx-serve/ablation load when the server starts.")
+        .help(ablationAppliesNote)
     }
 
     private func reload() {
@@ -124,7 +127,7 @@ struct AblationSection: View {
             if let error = c.error {
                 Text(verbatim: error).font(.app(.caption)).foregroundStyle(.orange)
             }
-            Text("Applies to every request to this model, from any app. Profiles in ~/.mlx-serve/ablation load when the server starts.")
+            Text(ablationAppliesNote)
                 .font(.app(.caption)).foregroundStyle(.secondary)
         }
     }

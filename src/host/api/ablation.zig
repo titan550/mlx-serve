@@ -409,15 +409,10 @@ pub fn headerLine(buf: []u8, sel: Selected) []const u8 {
 pub fn forRequest(conn: *Conn, root: std.json.ObjectMap, lm: *LoadedModel) ?Refusal {
     const field = root.get("ablation") orelse return forModelSetting(conn, lm);
     const set = if (http_server.g_ablation) |*s| s else null;
-    const config = lm.config orelse return bad("this model does not serve ablation").refused;
-    const serves = if (config.plugin) |pb| pb.parsed.caps.ablation else false;
+    if (lm.config == null) return bad("this model does not serve ablation").refused;
     // The pack's config is read only for a request that holds the key (`resolve` checks it first).
     const authorized = if (set) |s| if (conn.ablation_key) |k| s.keyMatches(k) else false else false;
-    const served: Served = .{
-        .hidden = config.hidden_size,
-        .serves = serves,
-        .config_sha256 = if (authorized and serves) modelDigest(conn.io, lm) else null,
-    };
+    const served = servedFor(conn.io, lm, authorized);
     const sel = switch (resolve(set, field, conn.ablation_key, served, &conn.ablation_header)) {
         .refused => |r| {
             // The message may sit in the header buffer: keep it, but never send it as a header.
@@ -440,13 +435,15 @@ pub const SettingOutcome = union(enum) { none, selected: Selected, refused: []co
 pub fn resolveSetting(io: std.Io, lm: *LoadedModel, msg_buf: []u8) SettingOutcome {
     const entry = request_model.g_model_aliases.ablationSetting(io, lm.path);
     if (entry == .none) return .none;
-    return settingFor(&entry, if (http_server.g_ablation) |*g| g else null, servedFor(io, lm), msg_buf);
+    return settingFor(&entry, if (http_server.g_ablation) |*g| g else null, servedFor(io, lm, true), msg_buf);
 }
 
-fn servedFor(io: std.Io, lm: *LoadedModel) Served {
+/// What `lm` serves for ablation. `authorized` gates reading the pack's `config.json` for a request's field, which a
+/// model setting does not need (the operator wrote it).
+fn servedFor(io: std.Io, lm: *LoadedModel, authorized: bool) Served {
     const config = lm.config orelse return .{ .hidden = 0, .serves = false, .config_sha256 = null };
     const serves = if (config.plugin) |pb| pb.parsed.caps.ablation else false;
-    return .{ .hidden = config.hidden_size, .serves = serves, .config_sha256 = if (serves) modelDigest(io, lm) else null };
+    return .{ .hidden = config.hidden_size, .serves = serves, .config_sha256 = if (authorized and serves) modelDigest(io, lm) else null };
 }
 
 fn settingFor(entry: *const AblationSetting, set: ?*const Set, served: Served, msg_buf: []u8) SettingOutcome {
@@ -488,7 +485,7 @@ pub fn forModelSetting(conn: *Conn, lm: *LoadedModel) ?Refusal {
 pub fn propsJson(a: std.mem.Allocator, io: std.Io, lm: *LoadedModel) ![]u8 {
     const entry = request_model.g_model_aliases.ablationSetting(io, lm.path);
     var msg: [192]u8 = undefined;
-    const outcome = if (entry == .none) SettingOutcome.none else settingFor(&entry, if (http_server.g_ablation) |*g| g else null, servedFor(io, lm), &msg);
+    const outcome = if (entry == .none) SettingOutcome.none else settingFor(&entry, if (http_server.g_ablation) |*g| g else null, servedFor(io, lm, true), &msg);
     return propsFragment(a, &entry, outcome);
 }
 
