@@ -1,6 +1,7 @@
 //! /props, batching, settings, ANE stats, status page
 
 const std = @import("std");
+const ablation = @import("ablation.zig");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const decode_attn_quant_mod = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
@@ -287,7 +288,9 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     defer allocator.free(cluster_json);
     const plugins_json = try plugin_loader.processStatusJson(allocator, auth.peerIsLoopback(stream));
     defer allocator.free(plugins_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s},\"plugins\":{s},\"registry_generation\":{d}", .{ engine_json, batching_json, settings_json, cluster_json, plugins_json, registryGeneration() });
+    const ablation_json = try ablation.propsJson(allocator, stream.io, lm);
+    defer allocator.free(ablation_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"plugins\":{s},\"registry_generation\":{d}", .{ engine_json, batching_json, settings_json, cluster_json, ablation_json, plugins_json, registryGeneration() });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (http_server.launch().global_scheduler) |sch|

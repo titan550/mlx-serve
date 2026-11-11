@@ -323,8 +323,9 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.media,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head, .tail_hidden = &mtp_tail } else null,
-                @intFromPtr(slot),
-                slot.skip_prefix_cache or slot.cache_variant != 0,
+                // A `read` ablation commits nothing, so it restores by copy: a moved entry dies with its slot.
+                if (slot.reads_base_prefix) null else @intFromPtr(slot),
+                slot.skip_prefix_cache or (slot.cache_variant != 0 and !slot.reads_base_prefix),
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -435,7 +436,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 fits = Probe.call(&probe);
             };
             // A shared restore is billed a whole second copy; taking the entry over moves it instead.
-            if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |hc| {
+            if (!fits and !hot_checked_out and hot_matched > 0 and !slot.reads_base_prefix) if (slot.model.prefix_cache) |hc| {
                 if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len)) {
                     hot_checked_out = true;
                     probe.warm_will_donate = true;
