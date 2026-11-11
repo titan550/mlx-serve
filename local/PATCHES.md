@@ -188,6 +188,6 @@ count is `dev-build-version`'s 2 lines.
   moved to `cfc3704` since the review and its `KIT_VERSION` is 26.11.3 while mlx-serve's newest tag is
   v26.11.2, so it was built here against our 26.11.2 kit. The dropped per-layer bank (measured worse, see
   `ablation-profile-name`) is preserved on the same fork as `feature/per-layer-bank`.
-  Local layout: bare `~/workplace/local-ai/mlx-serve-plugins.git` (origin = the fork, upstream =
-  CommunityServe/plugins), main worktree `~/workplace/local-ai/mlx-serve-plugins`, and `~/.mlx-serve/plugin-src`
-  is a symlink to that worktree. Installed sha256 `b73e2cd6…`.
+  Local layout: `~/workplace/local-ai/mlx-serve-plugins/` holds `.bare` (origin = the fork, upstream =
+  CommunityServe/plugins) and `wt/` for its worktrees — `wt/main` (the build checkout, `~/.mlx-serve/plugin-src`
+  symlinks here) and `wt/sushi-ds41-ablation-strength` (the PR). Installed sha256 `c7240cd9…`.
