@@ -53,7 +53,7 @@ const mix_launch: metal.Launch = .{
 fn ndLaunch(comptime m: u32) metal.Launch {
     return .{
         .name = "mlxserve_hc_read_nd",
-        .inputs = &.{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in", "dw_q", "dw_s", "dw_b" },
+        .inputs = &.{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in", "ad_in", "as_in", "dw_q", "dw_s", "dw_b" },
         .outputs = &.{ "xn_out", "parts_out", "xs_out" },
         .source = hd2.ND_SOURCE,
         .header = hd2.PACK8_HEADER,
@@ -350,7 +350,19 @@ const PrefillMix = struct {
 /// Which outputs an `nd` registration reads: the normed and written streams (bf16), or the down/inject partials (f32).
 const NdPart = enum { streams, partials };
 
-const Cfg = struct { bits: u32, gs: usize = 64, inj: bool = true, wr: bool = true };
+const Cfg = struct {
+    bits: u32,
+    gs: usize = 64,
+    inj: bool = true,
+    wr: bool = true,
+    /// Directional ablation rides the pending write (one slot per row), so it needs `wr`.
+    ab: bool = false,
+
+    /// Whether this shape's launch reads the ablation operands.
+    fn ablates(self: Cfg) bool {
+        return self.ab and self.wr;
+    }
+};
 
 /// A shape's rows are the decode rows; the geometry is Flash Next's.
 const Nd = struct {
@@ -365,8 +377,11 @@ const Nd = struct {
     iw: []f64 = &.{},
     wo: []f64 = &.{},
     wi: []f64 = &.{},
+    /// Each row's ablation direction (f32) and strength.
+    ad: []f64 = &.{},
+    as: []f64 = &.{},
     dw: host.Quant = undefined,
-    args: [9]mlx.mlx_array = undefined,
+    args: [11]mlx.mlx_array = undefined,
 
     fn init(a: std.mem.Allocator, launch: *const metal.Launch, cfg: Cfg, part: NdPart) Nd {
         return .{ .rig = metal.Rig.init(a), .launch = launch, .cfg = cfg, .part = part, .arena = .init(a) };
@@ -398,6 +413,8 @@ const Nd = struct {
         g.int("WR", @intFromBool(c.wr));
         g.int("RPS", 1);
         g.int("ROWS_TG", 8);
+        g.int("AB", @intFromBool(c.ablates()));
+        g.int("SEQ", 1);
         return g;
     }
 
@@ -415,17 +432,21 @@ const Nd = struct {
         self.iw = try host.uniform(a, rng, K * HC, -0.05, 0.05, .bfloat16);
         self.wo = try host.uniform(a, rng, rows * HID, -1, 1, .bfloat16);
         self.wi = try host.uniform(a, rng, rows * HC, 0.5, 1.5, .bfloat16);
+        self.ad = try host.uniform(a, rng, rows * HID, -0.05, 0.05, .float32);
+        self.as = try host.uniform(a, rng, rows, 0, 1, .float32);
         self.dw = try host.quantize(a, rng, R, K, c.bits, c.gs, .bfloat16);
         switch (fill) {
             .random => {},
             .nonfinite => host.plant(self.x, rows * HC, HID),
             .stress => {
                 // Gate 4: rows of +-8 norm to +-1 exactly (fast rsqrt's ulps cannot move a bf16 rounding there), unit
-                // weights times small integers; the partials sum integer products past fp16's integers.
+                // weights times small integers; the partials sum integer products past fp16's integers. A zero
+                // direction keeps the ablation out of the margin argument.
                 for (self.x) |*v| v.* = if (rng.boolean()) 8 else -8;
                 for (self.nw) |*v| v.* = @floatFromInt(rng.intRangeAtMost(i32, 1, 4));
                 for (self.iw) |*v| v.* = @floatFromInt(rng.intRangeAtMost(i32, -4, 4));
                 @memset(self.wo, 0);
+                @memset(self.ad, 0);
                 try integerWeights(a, rng, &self.dw, R, K, c.bits, c.gs, false);
             },
         }
@@ -435,13 +456,17 @@ const Nd = struct {
         const words: c_int = @intCast(K * c.bits / 32);
         const dense = c.bits == 16;
         const nw = try rig.input(.bfloat16, &.{ HC, HID }, self.nw);
+        const eps = try rig.input(.float32, &.{1}, &[_]f64{EPS});
+        const ab = c.ablates();
         self.args = .{
             try rig.input(.bfloat16, &.{ 1, rws, K }, self.x),
             nw,
             if (c.inj) try rig.input(.bfloat16, &.{ K, HC }, self.iw) else nw,
-            try rig.input(.float32, &.{1}, &[_]f64{EPS}),
+            eps,
             if (c.wr) try rig.input(.bfloat16, &.{ 1, rws, HID }, self.wo) else nw,
             if (c.wr) try rig.input(.bfloat16, &.{ 1, rws, HC, 1 }, self.wi) else nw,
+            if (ab) try rig.input(.float32, &.{ rws, HID }, self.ad) else nw,
+            if (ab) try rig.input(.float32, &.{rws}, self.as) else eps,
             try rig.input(.uint32, &.{ R, words }, self.dw.words),
             if (dense) nw else try rig.input(.bfloat16, &.{ R, @intCast(K / c.gs) }, self.dw.scales),
             if (dense) nw else try rig.input(.bfloat16, &.{ R, @intCast(K / c.gs) }, self.dw.biases),
@@ -472,21 +497,58 @@ const Nd = struct {
         defer a.free(xn);
         const terms = try a.alloc(f64, HID);
         defer a.free(terms);
+        // The written values' own error (the ablation's f32 dot and products; 0 without one).
+        const ev = try a.alloc(f64, HID);
+        defer a.free(ev);
+        const out = try a.alloc(Val, HID);
+        defer a.free(out);
         const per = HID / 256;
         const ss_depth: f64 = @floatFromInt(per + 5 + 8);
+        const ab = c.ablates();
         for (0..self.shape.rows) |row| for (0..HC) |s| {
             const base = s * HID;
-            for (xv, sq, 0..) |*o, *q, i| {
+            for (out, 0..) |*o, i| o.* = .{ .v = if (c.wr) self.wo[row * HID + i] else 0 };
+            if (ab) {
+                // dot(out, d) summed as the square sum is, times the strength; `out` loses cs * d in f32, then rounds.
+                var dot_m: f64 = 0;
+                for (terms, out, 0..) |*t, o, i| {
+                    t.* = o.v * self.ad[row * HID + i];
+                    dot_m += @abs(t.*);
+                }
+                const dot = if (acc) |ac| spec.sumIn(ac, order, terms) else host.sum(terms);
+                const cs = dot * self.as[row];
+                const e_cs = spec.gamma(ss_depth, U) * dot_m + U * @abs(cs);
+                for (out, 0..) |*o, i| {
+                    const d = self.ad[row * HID + i];
+                    const moved = o.v - cs * d;
+                    o.* = host.round(.bfloat16, .{ .v = moved, .e = @abs(d) * e_cs + U * @abs(cs * d) + U * @abs(moved) });
+                }
+            }
+            for (xv, ev, out, 0..) |*o, *e, w_out, i| {
                 const x = self.x[row * K + base + i];
-                o.* = if (c.wr) host.rt(.bfloat16, x + host.rt(.bfloat16, self.wo[row * HID + i] * self.wi[row * HC + s])) else x;
-                q.* = o.* * o.*;
+                if (!c.wr) {
+                    o.* = x;
+                    e.* = 0;
+                    continue;
+                }
+                const g = self.wi[row * HC + s];
+                const p = host.round(.bfloat16, .{ .v = w_out.v * g, .e = @abs(g) * w_out.e });
+                const v = host.round(.bfloat16, .{ .v = x + p.v, .e = p.e });
+                o.* = v.v;
+                e.* = v.e;
+            }
+            var ss_e: f64 = 0;
+            for (sq, xv, ev) |*q, v, e| {
+                q.* = v * v;
+                ss_e += 2 * @abs(v) * e;
             }
             const ss = if (acc) |ac| spec.sumIn(ac, order, sq) else host.sum(sq);
             const rsh = 1 / @sqrt(ss / HID + EPS);
-            // The sum's rounding (halved by the square root), the mean, + eps, fast rsqrt (2 ulps), the product.
-            const rel = spec.gamma(ss_depth, U) / 2 + 3 * U + 2 * 0x1p-23;
-            for (xn, xv, 0..) |*o, v, i| {
-                const inner = host.round(.bfloat16, .{ .v = v * rsh, .e = @abs(v * rsh) * rel });
+            // The sum's rounding (halved by the square root), the mean, + eps, fast rsqrt (2 ulps), the product; the
+            // written values' error reaches the sum of squares too.
+            const rel = spec.gamma(ss_depth, U) / 2 + 3 * U + 2 * 0x1p-23 + (if (ss > 0) ss_e / ss / 2 else 0);
+            for (xn, xv, ev, 0..) |*o, v, e, i| {
+                const inner = host.round(.bfloat16, .{ .v = v * rsh, .e = @abs(v * rsh) * rel + rsh * e });
                 const w = self.nw[base + i];
                 o.* = host.round(.bfloat16, .{ .v = inner.v * w, .e = @abs(w) * inner.e });
                 if (self.part == .streams) {
@@ -495,7 +557,7 @@ const Nd = struct {
                     if (mag) |m| m[at] = host.allowance(@abs(w) * inner.e);
                     if (c.wr) {
                         want[self.shape.rows * K + at] = v;
-                        if (mag) |m| m[self.shape.rows * K + at] = 0;
+                        if (mag) |m| m[self.shape.rows * K + at] = if (e == 0) 0 else host.allowance(e);
                     }
                 }
             }
@@ -823,6 +885,7 @@ pub fn register(set: *kc.Set) !void {
     try set.add(Nd, .init(a, &nd8, .{ .bits = 8 }, .partials), decodeSpec("hc_read_nd 8-bit (down + inject partials)", .f32, decode_rows, exact), null);
     try set.add(Nd, .init(a, &nd8, .{ .bits = 8, .wr = false }, .streams), decodeSpec("hc_read_nd 8-bit (no pending write)", .bf16, decode_one, norm_sums), null);
     try set.add(Nd, .init(a, &nd8, .{ .bits = 8, .inj = false }, .streams), decodeSpec("hc_read_nd 8-bit (no inject)", .bf16, decode_one, norm_sums), null);
+    try set.add(Nd, .init(a, &nd8, .{ .bits = 8, .ab = true }, .streams), decodeSpec("hc_read_nd 8-bit (pending write + ablation)", .bf16, decode_rows, norm_sums), null);
     try set.add(Nd, .init(a, &nd4, .{ .bits = 4 }, .partials), decodeSpec("hc_read_nd 4-bit (down + inject partials)", .f32, decode_rows, exact), null);
     try set.add(Nd, .init(a, &nd16, .{ .bits = 16 }, .partials), decodeSpec("hc_read_nd bf16 weights (down + inject partials)", .f32, decode_one, exact), null);
     const up_sums: spec.Sums = .{ .f16 = 100, .bf16 = 100 };
@@ -851,7 +914,8 @@ fn decodeDrift(a: std.mem.Allocator, nd: *Nd, up: *Up, rows: usize) !void {
     const u = up.args;
     const dense = c.bits == 16;
     const none = mlx.mlx_array{ .ctx = null };
-    const out = (try hd2.read(nd.rig.stream(), x[0], x[1], x[6], if (dense) none else x[7], if (dense) none else x[8], u[2], if (dense) none else u[3], if (dense) none else u[4], if (c.inj) x[2] else none, x[3], @intCast(rows), HC, HID, c.bits, @intCast(c.gs), if (c.wr) .{ .out = x[4], .inj = x[5] } else null)) orelse return error.Declined;
+    const ab: ?hd2.Ablate = if (c.ablates()) .{ .dirs = x[6], .strengths = x[7], .per = 1 } else null;
+    const out = (try hd2.read(nd.rig.stream(), x[0], x[1], x[8], if (dense) none else x[9], if (dense) none else x[10], u[2], if (dense) none else u[3], if (dense) none else u[4], if (c.inj) x[2] else none, x[3], @intCast(rows), HC, HID, c.bits, @intCast(c.gs), if (c.wr) .{ .out = x[4], .inj = x[5], .ablate = ab } else null)) orelse return error.Declined;
     defer for ([_]mlx.mlx_array{ out.mixed, out.inj, out.stream }) |o| if (o.ctx != null) {
         _ = mlx.mlx_array_free(o);
     };
@@ -881,7 +945,7 @@ test "kernel contract hc: each declared launch is the shipped wrapper's, byte fo
         try std.testing.expectEqualSlices(u8, try m.wrapper(), ours);
     }
     // The down weights the wrapper reads are the nd test's; the up launch binds them through `u`'s slots.
-    inline for (.{ .{ Cfg{ .bits = 8 }, &nd8, &upv8, true, 4 }, .{ Cfg{ .bits = 4 }, &nd4, &up4, false, 3 }, .{ Cfg{ .bits = 16, .inj = false }, &nd16, &up16, false, 1 } }) |case| {
+    inline for (.{ .{ Cfg{ .bits = 8 }, &nd8, &upv8, true, 4 }, .{ Cfg{ .bits = 8, .ab = true }, &nd8, &upv8, true, 4 }, .{ Cfg{ .bits = 4 }, &nd4, &up4, false, 3 }, .{ Cfg{ .bits = 16, .inj = false }, &nd16, &up16, false, 1 } }) |case| {
         var nd = Nd.init(a, case[1], case[0], .streams);
         defer nd.deinit();
         var up = Up.init(a, case[2], case[0], case[3]);

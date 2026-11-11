@@ -59,6 +59,9 @@ struct ModelOverride: Equatable {
     /// verbatim (`TemplateKwargs` types and names them).
     var templateKwargs: [String: Any] = [:]
     var generationDefaults = GenerationDefaults()
+    /// `ablation`: read by the server per request, so it needs no reload. One the
+    /// app cannot write back whole stays in `extra`.
+    var ablation: AblationSetting?
     var extra: [String: Any] = [:]
 
     init(ctxSize: Int? = nil, kvQuant: KvQuantChoice? = nil, mtp: Bool? = nil,
@@ -106,6 +109,10 @@ struct ModelOverride: Equatable {
             generationDefaults = parsed
             rest.removeValue(forKey: "generation_defaults")
         }
+        if let a = rest["ablation"].flatMap({ AblationSetting(json: $0) }) {
+            ablation = a
+            rest.removeValue(forKey: "ablation")
+        }
         extra = rest
     }
 
@@ -113,7 +120,7 @@ struct ModelOverride: Equatable {
     /// True when any field the sheet edits is set.
     var hasSettings: Bool {
         alias != nil || ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || mtpGreedyTail != nil || drafter != nil || int8Prefill != nil || ane != nil || engine != nil
-            || !templateKwargs.isEmpty || !generationDefaults.rules.isEmpty
+            || !templateKwargs.isEmpty || !generationDefaults.rules.isEmpty || ablation != nil
     }
     var sortedKwargKeys: [String] { templateKwargs.keys.sorted() }
 
@@ -131,6 +138,7 @@ struct ModelOverride: Equatable {
         if let engine { out["engine"] = engine }
         if !templateKwargs.isEmpty { out["chat_template_kwargs"] = templateKwargs }
         if !generationDefaults.rules.isEmpty { out["generation_defaults"] = generationDefaults.json }
+        if let ablation { out["ablation"] = ablation.json }
         return out
     }
 
@@ -150,19 +158,22 @@ struct ModelOverride: Equatable {
         return name.utf8.allSatisfy { $0 > 0x20 && $0 != 0x7f && !"@/\"\\".utf8.contains($0) }
     }
 
-    /// True when a field the server reads at LOAD differs; the alias does not count.
+    /// True when a field the server reads at LOAD differs; the per-request ones do not count.
     func changesLoad(from old: ModelOverride) -> Bool {
         var a = self, b = old
         a.alias = nil
         b.alias = nil
         a.generationDefaults = .init()
         b.generationDefaults = .init()
+        a.ablation = nil
+        b.ablation = nil
         return a != b
     }
 
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
         a.alias == b.alias && a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance && a.mtpGreedyTail == b.mtpGreedyTail && a.drafter == b.drafter
             && a.int8Prefill == b.int8Prefill && a.ane == b.ane && a.engine == b.engine && a.generationDefaults == b.generationDefaults
+            && a.ablation == b.ablation
             && NSDictionary(dictionary: a.templateKwargs).isEqual(to: b.templateKwargs)
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }
@@ -198,6 +209,15 @@ struct ModelSettingsFile {
         var merged = o
         if let old = entries[Self.key(path)] { merged.extra.merge(old.extra) { mine, _ in mine } }
         if merged.isEmpty { entries.removeValue(forKey: Self.key(path)) } else { entries[Self.key(path)] = merged }
+    }
+
+    /// Replaces only this model's `ablation` (nil removes it, an unreadable one
+    /// too): the menu bar's edit leaves every other key as the file has it.
+    mutating func setAblation(_ setting: AblationSetting?, for path: String) {
+        var o = entries[Self.key(path)] ?? ModelOverride()
+        o.ablation = setting
+        o.extra["ablation"] = nil
+        entries[Self.key(path)] = o.isEmpty ? nil : o
     }
 
     /// Missing or malformed file = empty, same as the server.

@@ -23,6 +23,7 @@ const AttnDqCopy = @import("../../sdk/blocks/attention/decode_attn_quant.zig").A
 const QkAngleSlot = @import("../../sdk/blocks/rope/qk_norm_rope.zig").QkAngleSlot;
 const DtypeCastCache = @import("../../mlx/dtype.zig").DtypeCastCache;
 const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
+const Ablation = @import("ablate.zig").Ablation;
 
 pub const Trunk = struct {
     /// Borrowed: its owner (the plugin's model, or the engine's legacy shell) frees it after the trunk.
@@ -86,6 +87,8 @@ pub const Trunk = struct {
     gdn_eps: ?mlx.mlx_array = null,
     /// A verify forward in flight: the recurrent layers keep each row's state for the partial-accept rollback.
     spec_capture_ssm: bool = false,
+    /// The forward in flight's directional ablation (`Forward.ablation`), set by the plugin around it; borrowed.
+    ablation: ?*const Ablation = null,
     bits_cache: BitsCache = .{},
     /// Decode-only int8/nvfp4 copies of dense attention projections, by the weight's pointer (null = ineligible).
     attn_dq: std.AutoHashMapUnmanaged(usize, ?AttnDqCopy) = .empty,
@@ -137,6 +140,7 @@ pub const Trunk = struct {
     pub const hcSiluCallback = @import("hc.zig").hcSiluCallback;
     pub const hcWrite = @import("hc.zig").hcWrite;
     pub const hcWriteCallback = @import("hc.zig").hcWriteCallback;
+    pub const hcWriteAblated = @import("hc.zig").hcWriteAblated;
     pub const hcWriteOrDefer = @import("hc.zig").hcWriteOrDefer;
     // mtp.zig
     pub const HeadPlace = @import("mtp.zig").HeadPlace;

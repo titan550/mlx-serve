@@ -79,6 +79,8 @@ final class ServerOptionsTests: XCTestCase {
         }
         // ALWAYS-emitted flags (authoritative from the app) MUST be present.
         XCTAssertTrue(args.contains("--prefix-cache-entries"))
+        XCTAssertTrue(args.contains("--ablation-profiles"))
+        XCTAssertTrue(args.contains("--ablation-key-file"))
         // The SSD tier is always emitted so it can't be silently on via a
         // server default; a fresh (toggle-off) launch emits `off`.
         XCTAssertTrue(contains(args, flag: "--prefix-cache-disk", value: "off"))
@@ -1116,5 +1118,20 @@ extension ServerOptionsTests {
         XCTAssertEqual(ServerOptions.idleEvictLabel(1800), "30 min")
         XCTAssertEqual(ServerOptions.idleEvictLabel(3600), "1 hr")
         XCTAssertEqual(ServerOptions.idleEvictLabel(7200), "2 hr")
+    }
+}
+
+extension ServerOptionsTests {
+    /// Bar: every launch, headless included, names the app's ablation folder and key (`AblationFiles` makes both).
+    func testAblationFlagsRideEveryLaunch() {
+        let profiles = NSString(string: "~/.mlx-serve/ablation").expandingTildeInPath
+        let key = NSString(string: "~/.mlx-serve/ablation.key").expandingTildeInPath
+        var tuned = ServerOptions()
+        tuned.port = 9000
+        tuned.mlxGguf = true
+        for args in [ServerOptions().toCLIArgs(), tuned.toCLIArgs(modelDirs: ["/m"])] {
+            XCTAssertTrue(contains(args, flag: "--ablation-profiles", value: profiles), "\(args)")
+            XCTAssertTrue(contains(args, flag: "--ablation-key-file", value: key), "\(args)")
+        }
     }
 }

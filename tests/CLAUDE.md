@@ -62,6 +62,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_responses_api.sh`, `test_responses_streaming.sh` /v1/responses · `test_output_config.sh` Anthropic `output_config`
 - `test_ollama_api.sh` /api/* · `test_continuation.sh` continue a partial reply · `test_timings.sh` `timings` block
 - `test_models_capabilities.sh` /v1/models capabilities · `test_metrics.sh`, `test_metrics_outcomes.sh` --metrics
+- `test_ablation_model_setting.sh` **E** the `ablation` model setting: every surface, no key, strength 0 = stock bytes, a 503 `/props` explains
 - `test_index_page.sh` **H** console at GET / · `test_route_404_no_load.sh` unknown path loads nothing
 - `test_headless_spec_flags.sh` **H** headless honours spec flags, 404 before resolution
 - `test_providers.sh` **H** upstream providers via stubs · `test_launch_cmd.sh` `mlx-serve launch <agent>`
@@ -136,6 +137,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 
 **Architectures (live)**
 - `test_qwen4_exp.sh` **E** Flash Next (external PLE or embedded `shards.N` / `shard_N`) · `test_qwen4_mtp_{padded_head,head_persist}.sh` **E** its MTP head
+- `test_qwen4_ablation.sh` **E** Flash Next directional ablation: strength 0 = stock bytes, strength 1 changes the answer, the fold engaged
 - `test_qsa_nax_prefill.py` **R** QSA NAX prefill · `qsa_nax_precision.py` float64 QSA kernel oracle
 - `test_dsv4.sh` **E**, `test_dsv41.sh` **E** DeepSeek V4/V4.1 · `test_inkling.sh` **E** · `test_bailing_hybrid.sh` **E** Ling 3.0
 - `test_muse_glimmer.sh` **E**, `test_muse_repetition.sh` **E** Muse · `test_mimo_v2.sh` **E** · `test_glm5_next.sh` **E**

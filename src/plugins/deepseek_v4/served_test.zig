@@ -275,6 +275,71 @@ test "deepseek_v41 served: an ablated request restores and commits only entries 
     }
 }
 
+test "served: an ablated request shares a KV prefix cache as its prefix_cache says" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    // A KV prefix cache (llama's, not module-owned state): the cache rules are the host's.
+    const llama = @import("../llama/plugin.zig");
+    const p = try Served.open(&llama.table, (try llama.conformanceFixture(aa)).files, "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    p.cfg.plugin.?.parsed.caps.ablation = true;
+    const pc = h.entry.prefix_cache.?;
+    const dir = try aa.alloc(f32, @intCast(p.cfg.hidden_size));
+    @memset(dir, 0);
+    dir[1] = 1;
+    const Prefix = @import("../../sdk/request/ablation.zig").Prefix;
+    const Run = struct {
+        /// Runs `prompt` to its commit; the tokens it restored.
+        fn go(hh: *Requests, prompt: []const u32, prefix: ?Prefix, d: []const f32) !u32 {
+            const s = try RequestSlot.init(testing.allocator, hh.sch.io, hh.entry.config.?, .{
+                .model = hh.entry,
+                .prompt_ids = prompt,
+                .sampling = .{ .temperature = 0 },
+                .eos_token_ids = &.{},
+                .max_tokens = 2,
+                .ablation = if (prefix) |px| .{ .direction = d, .strength = 1, .key = 7, .prefix = px } else null,
+            }, KVQuantConfig.dense);
+            defer s.deinit();
+            try prefill_request.runPrefill(&hh.sch, s);
+            commit_request.commitSlotIfApplicable(&hh.sch, s);
+            finish_request.finishSlot(&hh.sch, s, "length");
+            finish_request.releasePluginSlot(s);
+            return s.cached_tokens;
+        }
+        /// The committed conversation that starts with `head`, one more token after it: the next turn's prompt.
+        fn nextTurn(a: std.mem.Allocator, cache: *prefix_cache.HotPrefixCache, head: []const u32) ![]u32 {
+            for (cache.entries.items) |e| if (std.mem.startsWith(u32, e.tokens, head)) {
+                const out = try a.alloc(u32, e.tokens.len + 1);
+                @memcpy(out[0..e.tokens.len], e.tokens);
+                out[e.tokens.len] = 99;
+                return out;
+            };
+            return error.NoCommittedEntry;
+        }
+    };
+    const a = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    const b = [_]u32{ 5, 8, 13, 21, 34, 55, 89, 4 };
+    try testing.expectEqual(@as(u32, 0), try Run.go(h, &a, null, dir));
+    const next_a = try Run.nextTurn(aa, pc, &a);
+    const kept: u32 = @intCast(next_a.len - 1);
+    // isolated: no restore, no commit; read: restores by copy and commits nothing, so a plain turn still restores.
+    try testing.expectEqual(@as(u32, 0), try Run.go(h, next_a, .isolated, dir));
+    try testing.expectEqual(@as(usize, 1), pc.entries.items.len);
+    try testing.expectEqual(kept, try Run.go(h, next_a, .read, dir));
+    try testing.expectEqual(@as(usize, 1), pc.entries.items.len);
+    try testing.expectEqual(kept, try Run.go(h, next_a, null, dir));
+    // shared: commits under the plain key, which the plain turn after it restores.
+    const before = pc.entries.items.len;
+    try testing.expectEqual(@as(u32, 0), try Run.go(h, &b, .shared, dir));
+    try testing.expectEqual(before + 1, pc.entries.items.len);
+    const next_b = try Run.nextTurn(aa, pc, &b);
+    try testing.expectEqual(@as(u32, @intCast(next_b.len - 1)), try Run.go(h, next_b, null, dir));
+}
+
 /// Real request functions over a tiny plugin and a registry; no inference worker is started.
 const Requests = struct {
     sch: scheduler.Scheduler = undefined,

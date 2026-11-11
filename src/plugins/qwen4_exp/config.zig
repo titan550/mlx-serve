@@ -686,6 +686,9 @@ pub fn facts(c: *Config) abi.Parsed {
         .spec_rollback = true,
         .images = c.qwen_vision,
         .video = c.qwen_vision,
+        // Every residual write, the embedding and the PLE add included; the MTP head's drafts run unablated (the
+        // verify decides every token).
+        .ablation = true,
     };
     const s = &p.shell;
     s.* = .{
@@ -821,7 +824,7 @@ test "qwen4_exp config: the flat text pack parses with the family defaults and i
     try testing.expectEqual(@as(?u32, 20), c.gen_top_k);
     try testing.expect(!c.qwen_vision and !c.isFullLayer(0) and c.isFullLayer(1) and c.attnLayers() == 2);
     const p = facts(c);
-    try testing.expect(p.caps.batches_decode and p.caps.long_ctx and p.caps.moe and !p.caps.images and !p.caps.batch_per_slot_attn);
+    try testing.expect(p.caps.batches_decode and p.caps.long_ctx and p.caps.moe and !p.caps.images and !p.caps.batch_per_slot_attn and p.caps.ablation);
     try testing.expectEqual(@as(u32, 1), p.shell.eos_count);
     try testing.expectEqual(@as(f32, 1.0), p.spec.policy.draft_temperature);
 }

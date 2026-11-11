@@ -50,6 +50,16 @@ enum ModelSettingsApply {
         }
     }
 
+    /// What Save writes: the sheet's edits over its snapshot, except `ablation`, which the menu bar also writes while
+    /// the sheet is open; unless changed here, it stays as the file holds it now.
+    static func entryToSave(edited: ModelOverride, initial: ModelOverride, onDisk: ModelOverride?) -> ModelOverride {
+        guard edited.ablation == initial.ablation else { return edited }
+        var out = edited
+        out.ablation = onDisk?.ablation
+        out.extra["ablation"] = onDisk?.extra["ablation"]
+        return out
+    }
+
     /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
     static func hasInt8PrefillRoute(modelType: String?) -> Bool {
         modelType == "prism_hadamard_qwen35"
@@ -283,6 +293,10 @@ struct ModelSettingsSheet: View {
                 }
                 .help("What serves this model; Automatic leaves it to the server. The Neural Engine leaves the GPU free (text only; the first load on this Mac compiles it for minutes).")
                 }
+                if let live, !live.ablationProfiles.isEmpty {
+                    AblationSection(setting: $override.ablation, profiles: live.ablationProfiles,
+                                    status: server.ablationStatus, modelId: live.name)
+                }
                 Section("Generation defaults") {
                     if override.extra["generation_defaults"] != nil {
                         Text("The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here.")
@@ -398,7 +412,8 @@ struct ModelSettingsSheet: View {
         }
         if bindsDflash { override.mtpAcceptance = nil; override.mtpGreedyTail = nil }
         var file = ModelSettingsFile.load()
-        file.set(override, for: request.path)
+        file.set(ModelSettingsApply.entryToSave(edited: override, initial: initialOverride,
+                                                onDisk: file.override(for: request.path)), for: request.path)
         do {
             try file.save()
         } catch {

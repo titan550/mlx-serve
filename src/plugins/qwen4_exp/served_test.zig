@@ -17,6 +17,8 @@ const MtpHeadRef = @import("../../engines/mlx/spec/mtp_head_ref.zig").MtpHeadRef
 const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
+const CaptureLayers = @import("../../engines/mlx/forward_ctx.zig").CaptureLayers;
+const AblationRequest = @import("../../sdk/request/ablation.zig").Request;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const nextSsmMemberGen = @import("../../engines/mlx/ssm/group.zig").nextSsmMemberGen;
@@ -298,6 +300,214 @@ test "qwen4_exp served: greedy decode and MTP rounds emit the legacy tokens and 
         if (opts.sign_head) try testing.expect(auto > 0 and pinned > 0);
         try oracle.close();
     }
+}
+
+fn hostF32(x: Array) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, x, .float32, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(f));
+    return testing.allocator.dupe(f32, mlx.mlx_array_data_float32(f).?[0..mlx.mlx_array_size(f)]);
+}
+
+/// The largest |cos| between a stream of `streams` [B, S, hc*hidden] and its batch row's direction (one per row, or one
+/// for all).
+fn maxCos(streams: Array, dirs: []const []const f32) !f64 {
+    const v = try hostF32(streams);
+    defer testing.allocator.free(v);
+    const shape = mlx.getShape(streams);
+    const b: usize = @intCast(shape[0]);
+    const hidden = dirs[0].len;
+    const per_b = v.len / b;
+    var worst: f64 = 0;
+    for (0..b) |bi| {
+        const d = dirs[if (dirs.len == b) bi else 0];
+        var at: usize = bi * per_b;
+        while (at < (bi + 1) * per_b) : (at += hidden) {
+            var dot: f64 = 0;
+            var nn: f64 = 0;
+            for (v[at..][0..hidden], d) |x, y| {
+                dot += @as(f64, x) * y;
+                nn += @as(f64, x) * x;
+            }
+            if (nn > 0) worst = @max(worst, @abs(dot) / @sqrt(nn));
+        }
+    }
+    return worst;
+}
+
+const ablation_prompts = [_][]const i32{ &.{ 4, 8, 15, 16, 23, 42, 9, 10, 11 }, &.{ 42, 101, 7, 1, 2 } };
+
+/// Each prompt's unablated last stream 0, normalized: a write that skips the projection leaves a large cosine with it.
+fn ablationDirections(p: *Pair) ![2][]f32 {
+    const a = testing.allocator;
+    const x = &p.served;
+    var dirs: [2][]f32 = undefined;
+    var made: usize = 0;
+    errdefer for (dirs[0..made]) |d| a.free(d);
+    for (ablation_prompts, 0..) |pr, i| {
+        var s: Slot = undefined;
+        try s.init(p.scfg.num_hidden_layers);
+        defer s.deinit(x);
+        var g = ops.Graph.init(a, mlx.gpuStream());
+        defer g.deinit();
+        var last = mlx.mlx_array_new();
+        var all = mlx.mlx_array_new();
+        _ = try g.adopt(try x.forwardWithCaptureAll(&s.ctx, try tokens(&g, pr), &last, &all));
+        _ = try g.adopt(last);
+        const host = try hostF32(try g.adopt(all));
+        defer a.free(host);
+        const hidden: usize = p.scfg.hidden_size;
+        const row = host[(pr.len - 1) * p.scfg.hc_count * hidden ..][0..hidden];
+        var nn: f64 = 0;
+        for (row) |v| nn += @as(f64, v) * v;
+        dirs[i] = try a.alloc(f32, hidden);
+        made += 1;
+        for (dirs[i], row) |*o, v| o.* = @floatCast(v / @sqrt(nn));
+    }
+    return dirs;
+}
+
+test "qwen4_exp served: an ablated slot's streams keep no component along its direction, on every forward path" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const p = try Pair.open(.q4, 61);
+    defer p.close();
+    const x = &p.served;
+    const dirs = try ablationDirections(p);
+    defer for (dirs) |d| a.free(d);
+    const reqs = [_]AblationRequest{ .{ .direction = dirs[0], .strength = 1, .key = 11 }, .{ .direction = dirs[1], .strength = 1, .key = 12 } };
+    var slots: [2]Slot = undefined;
+    for (&slots, 0..) |*s, i| {
+        try s.init(p.scfg.num_hidden_layers);
+        s.ctx.ablation = reqs[i];
+    }
+    defer for (&slots) |*s| s.deinit(x);
+    var worst: f64 = 0;
+
+    // Serial prefill, every layer's stream captured, then a decode step and a verify block.
+    const layer_ids = [_]u32{ 0, 1, 2, 3 };
+    for (ablation_prompts, 0..) |pr, i| {
+        var g = ops.Graph.init(a, mlx.gpuStream());
+        defer g.deinit();
+        var outs: [layer_ids.len]Array = undefined;
+        for (&outs) |*o| o.* = mlx.mlx_array_new();
+        var cl: CaptureLayers = .{ .ids = &layer_ids, .out = &outs };
+        slots[i].ctx.capture_layers = &cl;
+        var last = mlx.mlx_array_new();
+        var all = mlx.mlx_array_new();
+        _ = try g.adopt(try x.forwardWithCaptureAll(&slots[i].ctx, try tokens(&g, pr), &last, &all));
+        slots[i].ctx.capture_layers = null;
+        _ = try g.adopt(last);
+        for (outs) |o| worst = @max(worst, try maxCos(try g.adopt(o), &.{dirs[i]}));
+        worst = @max(worst, try maxCos(try g.adopt(all), &.{dirs[i]}));
+    }
+    for ([_]struct { ids: []const i32, verify: bool }{ .{ .ids = &.{88}, .verify = false }, .{ .ids = &.{ 5, 61, 100 }, .verify = true } }) |st| {
+        var g = ops.Graph.init(a, mlx.gpuStream());
+        defer g.deinit();
+        slots[0].ctx.capture_ssm_seq = st.verify;
+        slots[0].ctx.spec_verify = st.verify;
+        defer {
+            slots[0].ctx.capture_ssm_seq = false;
+            slots[0].ctx.spec_verify = false;
+        }
+        var last = mlx.mlx_array_new();
+        var all = mlx.mlx_array_new();
+        _ = try g.adopt(try x.forwardWithCaptureAll(&slots[0].ctx, try tokens(&g, st.ids), &last, &all));
+        _ = try g.adopt(last);
+        worst = @max(worst, try maxCos(try g.adopt(all), &.{dirs[0]}));
+    }
+
+    // The batched tick and a batched verify, each slot on its own direction.
+    const ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
+    {
+        var g = ops.Graph.init(a, mlx.gpuStream());
+        defer g.deinit();
+        var hidden: ?[]Array = null;
+        const offs = [_]u32{ @intCast(slots[0].off), @intCast(slots[1].off) };
+        const rows = try x.forwardMoeBatchedDecode(&.{ 77, 3 }, &ctxs, &offs, &hidden);
+        defer {
+            a.free(rows);
+            a.free(hidden.?);
+        }
+        for (rows) |r| _ = try g.adopt(r);
+        for (hidden.?, 0..) |h, i| worst = @max(worst, try maxCos(try g.adopt(h), &.{dirs[i]}));
+        for (&slots) |*s| s.off += 1;
+    }
+    {
+        var g = ops.Graph.init(a, mlx.gpuStream());
+        defer g.deinit();
+        const ids = [_]i32{ 5, 6, 7, 8, 9, 10 };
+        const offs = [_]u32{ @intCast(slots[0].off), @intCast(slots[1].off) };
+        var last = mlx.mlx_array_new();
+        var all = mlx.mlx_array_new();
+        const arr = try g.adopt(mlx.mlx_array_new_data(&ids, &[_]c_int{ 2, 3 }, 2, .int32));
+        _ = try g.adopt(try x.forwardMoeBatchedVerify(arr, &ctxs, &offs, &last, &all));
+        _ = try g.adopt(last);
+        worst = @max(worst, try maxCos(try g.adopt(all), &.{ dirs[0], dirs[1] }));
+        for (&slots) |*s| s.off += 3;
+    }
+
+    // The grouped verify, reached by symbol: the joined rows (width 3) and the per-row fallback (width 8).
+    for ([_]usize{ 3, 8 }) |width| {
+        var g = ops.Graph.init(a, mlx.gpuStream());
+        defer g.deinit();
+        var ids: [8]i32 = .{ 12, 13, 14, 15, 16, 17, 18, 19 };
+        const rows = [_]Array{ try tokens(&g, ids[0..width]), try tokens(&g, ids[0..width]) };
+        var logits: [2]Array = undefined;
+        var lasts: [2]Array = undefined;
+        var alls: [2]Array = undefined;
+        for (&slots) |*s| s.ctx.capture_ssm_seq = true;
+        defer for (&slots) |*s| {
+            s.ctx.capture_ssm_seq = false;
+        };
+        try x.forwardRowAxisVerify(&rows, &ctxs, &logits, &lasts, &alls, null, null);
+        for (0..2) |i| {
+            _ = try g.adopt(logits[i]);
+            _ = try g.adopt(lasts[i]);
+            worst = @max(worst, try maxCos(try g.adopt(alls[i]), &.{dirs[i]}));
+        }
+    }
+    // bf16 rounding leaves a few thousandths; a write that skips the projection leaves tenths.
+    std.debug.print("qwen4 ablation: worst |cos| with the ablated direction {d:.5}\n", .{worst});
+    try testing.expect(worst <= 0.02);
+}
+
+test "qwen4_exp served: an unablated slot batched beside an ablated one keeps the plain batch's bits" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const p = try Pair.open(.q4, 67);
+    defer p.close();
+    const x = &p.served;
+    const dirs = try ablationDirections(p);
+    defer for (dirs) |d| a.free(d);
+    var got: [2][]f32 = undefined;
+    for ([_]bool{ false, true }, 0..) |ablate, run| {
+        var slots: [2]Slot = undefined;
+        for (&slots) |*s| try s.init(p.scfg.num_hidden_layers);
+        defer for (&slots) |*s| s.deinit(x);
+        if (ablate) slots[0].ctx.ablation = .{ .direction = dirs[0], .strength = 1, .key = 21 };
+        for (ablation_prompts, 0..) |pr, i| {
+            var g = ops.Graph.init(a, mlx.gpuStream());
+            defer g.deinit();
+            _ = try g.adopt(try x.forwardWith(&slots[i].ctx, try tokens(&g, pr)));
+        }
+        const ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
+        var g = ops.Graph.init(a, mlx.gpuStream());
+        defer g.deinit();
+        var hidden: ?[]Array = null;
+        const offs = [_]u32{ @intCast(slots[0].off), @intCast(slots[1].off) };
+        const rows = try x.forwardMoeBatchedDecode(&.{ 77, 3 }, &ctxs, &offs, &hidden);
+        defer {
+            a.free(rows);
+            a.free(hidden.?);
+        }
+        for (rows) |r| _ = try g.adopt(r);
+        for (hidden.?) |h| _ = try g.adopt(h);
+        got[run] = try hostF32(rows[1]);
+    }
+    defer for (got) |v| a.free(v);
+    try testing.expectEqualSlices(f32, got[0], got[1]);
 }
 
 test "qwen4_exp served: an image prompt (M-RoPE table, rows spliced across a chunk boundary) equals the legacy path" {
